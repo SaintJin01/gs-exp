@@ -97,6 +97,10 @@ class OptimizationParams(ParamGroup):
         self.depth_l1_weight_final = 0.01
         self.random_background = False
         self.optimizer_type = "default"
+        self.lambda_repuls = 0.1
+        self.repuls_margin = 1.0
+        self.repuls_weight = 0.0001
+        self.repuls_k = 2
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

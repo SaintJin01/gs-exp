@@ -16,7 +16,7 @@ from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
-from utils.general_utils import safe_state, get_expon_lr_func
+from utils.general_utils import safe_state, get_expon_lr_func, build_rotation
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
@@ -39,6 +39,55 @@ try:
     SPARSE_ADAM_AVAILABLE = True
 except:
     SPARSE_ADAM_AVAILABLE = False
+
+def repulsion_loss(gaussians, opt, visibility_filter):
+    vis = visibility_filter
+    if vis.dim() > 1:
+        vis = vis.squeeze(-1)
+
+    # Only operate on Gaussians actually used in the current render
+    xyz = gaussians.get_xyz[vis]                      # (N, 3)
+    N = xyz.shape[0]
+    k = min(opt.repuls_k, N - 1)
+    if N <= 1:
+        return torch.zeros((), device=xyz.device)
+
+    # Build Σ_i = R_i diag(s_i^2) R_i^T
+    scales = gaussians.get_scaling[vis]                   # (N, 3)
+    rots = build_rotation(gaussians.get_rotation[vis])    # (N, 3, 3)
+    S2 = scales ** 2                                  # (N, 3)
+    RS2 = rots * S2.unsqueeze(1)                      # (N, 3, 3): R @ diag(s^2)
+    cov = RS2 @ rots.transpose(-1, -2)               # (N, 3, 3): Σ_i
+
+    # k-NN by Euclidean distance on centers (indices don't need grad)
+    with torch.no_grad():
+        chunk_size = 2048
+        nn_idx = torch.zeros(N, k, dtype=torch.long, device=xyz.device)
+        for i in range(0, N, chunk_size):
+            end = min(i + chunk_size, N)
+            d = torch.cdist(xyz[i:end], xyz)          # (chunk, N)
+            d[:, i:end].fill_diagonal_(float('inf'))  # exclude self
+            nn_idx[i:end] = d.topk(k, largest=False).indices
+
+    # d_ij = μ_i - μ_j
+    xyz_j = xyz[nn_idx]                              # (N, k, 3)
+    d_vec = xyz.unsqueeze(1) - xyz_j                 # (N, k, 3)
+
+    # S_ij = Σ_i + Σ_j
+    cov_j = cov[nn_idx]                              # (N, k, 3, 3)
+    S_ij = cov.unsqueeze(1) + cov_j                  # (N, k, 3, 3)
+    S_ij = S_ij + 1e-6 * torch.eye(3, device=xyz.device)  # numerical stability
+
+    # r_ij = sqrt(d_ij^T S_ij^-1 d_ij)
+    d_col = d_vec.unsqueeze(-1)                      # (N, k, 3, 1)
+    x = torch.linalg.solve(S_ij, d_col)             # (N, k, 3, 1)
+    r2 = (d_col.transpose(-1, -2) @ x).squeeze(-1).squeeze(-1)  # (N, k)
+    r = r2.clamp(min=0).sqrt()
+
+    # print(f"r max: {r.max()} r min: {r.min()} r mean: {r.mean()}")
+    loss = opt.repuls_weight * (torch.clamp(opt.repuls_margin - r, min=0) ** 2).sum()
+    return loss
+
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
 
@@ -111,6 +160,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
+        if iteration % 100 == 0:
+            n_vis = visibility_filter.shape[0] if visibility_filter.dim() > 1 else int(visibility_filter.sum().item())
+            print(f"[iter {iteration}] visible: {n_vis} / {gaussians.get_xyz.shape[0]}")
+
         if viewpoint_cam.alpha_mask is not None:
             alpha_mask = viewpoint_cam.alpha_mask.cuda()
             image *= alpha_mask
@@ -122,8 +175,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
         else:
             ssim_value = ssim(image, gt_image)
+            
+        # Repulsion loss
+        Lrps = repulsion_loss(gaussians, opt, visibility_filter)
 
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+        w_l1 = 1.0 - opt.lambda_dssim - opt.lambda_repuls/2
+        w_dssim = opt.lambda_dssim - opt.lambda_repuls/2
+        Ldssim = 1.0 - ssim_value
+        loss = w_l1 * Ll1 +  w_dssim * Ldssim + opt.lambda_repuls * Lrps
+
+        if iteration % 10 == 0:
+            print()
+            print(
+                f"[iter {iteration}] "
+                f"Ll1={Ll1.item():.6f} (w*={w_l1 * Ll1.item():.6f}) | "
+                f"Ldssim={Ldssim.item():.6f} (w*={opt.lambda_dssim * Ldssim.item():.6f}) | "
+                f"Lrps={Lrps.item():.6f} (w*={opt.lambda_repuls * Lrps.item():.6f})"
+            )
 
         # Depth regularization
         Ll1depth_pure = 0.0
