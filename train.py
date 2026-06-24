@@ -40,6 +40,43 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
+@torch.no_grad()
+def knn_indices(xyz, k, query_chunk=2048, db_chunk=16384):
+    """k nearest neighbours (exclude self) for every point in xyz.
+
+    The reference set is tiled over `db_chunk` columns so topk only runs over a
+    small (k + db_chunk) dimension. This avoids the CUDA topk illegal-access bug
+    on very large reduction dimensions and never materializes the full (N, N)
+    distance matrix; NaN distances are mapped to +inf so they are never picked.
+    """
+    N = xyz.shape[0]
+    dev = xyz.device
+    nn_idx = torch.empty(N, k, dtype=torch.long, device=dev)
+    for i in range(0, N, query_chunk):
+        end = min(i + query_chunk, N)
+        q = xyz[i:end]
+        rows = end - i
+        best_d = torch.full((rows, k), float("inf"), device=dev)
+        best_idx = torch.zeros((rows, k), dtype=torch.long, device=dev)
+        for j in range(0, N, db_chunk):
+            jend = min(j + db_chunk, N)
+            dblock = torch.cdist(q, xyz[j:jend])
+            dblock = torch.nan_to_num(dblock, nan=float("inf"),
+                                      posinf=float("inf"), neginf=float("inf"))
+            lo, hi = max(i, j), min(end, jend)
+            if lo < hi:                                 # exclude self
+                g = torch.arange(lo, hi, device=dev)
+                dblock[g - i, g - j] = float("inf")
+            idx_block = torch.arange(j, jend, device=dev).expand(rows, -1)
+            cat_d = torch.cat([best_d, dblock], dim=1)
+            cat_idx = torch.cat([best_idx, idx_block], dim=1)
+            kk = min(k, cat_d.shape[1])
+            best_d, sel = cat_d.topk(kk, largest=False)
+            best_idx = torch.gather(cat_idx, 1, sel)
+        nn_idx[i:end] = best_idx
+    return nn_idx
+
+
 def repulsion_loss(gaussians, opt, visibility_filter):
     vis = visibility_filter
     if vis.dim() > 1:
@@ -60,14 +97,7 @@ def repulsion_loss(gaussians, opt, visibility_filter):
     cov = RS2 @ rots.transpose(-1, -2)               # (N, 3, 3): Σ_i
 
     # k-NN by Euclidean distance on centers (indices don't need grad)
-    with torch.no_grad():
-        chunk_size = 2048
-        nn_idx = torch.zeros(N, k, dtype=torch.long, device=xyz.device)
-        for i in range(0, N, chunk_size):
-            end = min(i + chunk_size, N)
-            d = torch.cdist(xyz[i:end], xyz)          # (chunk, N)
-            d[:, i:end].fill_diagonal_(float('inf'))  # exclude self
-            nn_idx[i:end] = d.topk(k, largest=False).indices
+    nn_idx = knn_indices(xyz.detach(), k)
 
     # d_ij = μ_i - μ_j
     xyz_j = xyz[nn_idx]                              # (N, k, 3)
@@ -85,7 +115,9 @@ def repulsion_loss(gaussians, opt, visibility_filter):
     r = r2.clamp(min=0).sqrt()
 
     # print(f"r max: {r.max()} r min: {r.min()} r mean: {r.mean()}")
-    loss = opt.repuls_weight * (torch.clamp(opt.repuls_margin - r, min=0) ** 2).sum()
+    # Mean over all (N, k) neighbour pairs -> per-pair penalty, invariant to the
+    # number of (visible) Gaussians and to k.
+    loss = (torch.clamp(opt.repuls_margin - r, min=0) ** 2).mean()
     return loss
 
 
@@ -116,6 +148,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     viewpoint_indices = list(range(len(viewpoint_stack)))
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
+
+    # Track repulsion loss over the whole training for plotting
+    lrps_iters = []
+    lrps_values = []
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
@@ -160,9 +196,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
-        if iteration % 100 == 0:
-            n_vis = visibility_filter.shape[0] if visibility_filter.dim() > 1 else int(visibility_filter.sum().item())
-            print(f"[iter {iteration}] visible: {n_vis} / {gaussians.get_xyz.shape[0]}")
+        #if iteration % 100 == 0:
+        #    n_vis = visibility_filter.shape[0] if visibility_filter.dim() > 1 else int(visibility_filter.sum().item())
+        #    print(f"[iter {iteration}] visible: {n_vis} / {gaussians.get_xyz.shape[0]}")
 
         if viewpoint_cam.alpha_mask is not None:
             alpha_mask = viewpoint_cam.alpha_mask.cuda()
@@ -177,20 +213,37 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ssim_value = ssim(image, gt_image)
             
         # Repulsion loss
-        Lrps = repulsion_loss(gaussians, opt, visibility_filter)
+        # Effective weight: 0 before repuls_from_iter, then a linear warmup
+        # (0 -> lambda_repuls) over repuls_warmup iterations to avoid the early spike.
+        if iteration < opt.repuls_from_iter:
+            repuls_w = 0.0
+        elif opt.repuls_warmup > 0:
+            ramp = (iteration - opt.repuls_from_iter) / opt.repuls_warmup
+            repuls_w = opt.lambda_repuls * min(1.0, ramp)
+        else:
+            repuls_w = opt.lambda_repuls
 
-        w_l1 = 1.0 - opt.lambda_dssim - opt.lambda_repuls/2
-        w_dssim = opt.lambda_dssim - opt.lambda_repuls/2
-        Ldssim = 1.0 - ssim_value
-        loss = w_l1 * Ll1 +  w_dssim * Ldssim + opt.lambda_repuls * Lrps
+        loss = (1.0 - opt.lambda_dssim) * Ll1 +  opt.lambda_dssim * (1.0 - ssim_value)
+
+        # Skip the (expensive) repulsion computation entirely while its weight is 0.
+        if repuls_w > 0:
+            Lrps = repulsion_loss(gaussians, opt, visibility_filter)
+            loss = loss + repuls_w * Lrps
+            lrps = Lrps.item()
+            lrps_iters.append(iteration)
+            lrps_values.append(lrps)
+            if tb_writer:
+                tb_writer.add_scalar('train_loss_patches/repulsion_loss', lrps, iteration)
+        else:
+            lrps = 0.0
+        if tb_writer:
+            tb_writer.add_scalar('train_loss_patches/repulsion_weight', repuls_w, iteration)
 
         if iteration % 10 == 0:
             print()
             print(
-                f"[iter {iteration}] "
-                f"Ll1={Ll1.item():.6f} (w*={w_l1 * Ll1.item():.6f}) | "
-                f"Ldssim={Ldssim.item():.6f} (w*={opt.lambda_dssim * Ldssim.item():.6f}) | "
-                f"Lrps={Lrps.item():.6f} (w*={opt.lambda_repuls * Lrps.item():.6f})"
+                f"[iter {iteration}]"
+                f"Lrps={repuls_w * lrps:.6f})"
             )
 
         # Depth regularization
@@ -257,7 +310,38 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
-def prepare_output_and_logger(args):    
+    # Save repulsion-loss curve over the whole training
+    save_repulsion_plot(scene.model_path, lrps_iters, lrps_values)
+
+def save_repulsion_plot(model_path, iters, values):
+    if not iters:
+        return
+    import csv
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    # Raw data
+    csv_path = os.path.join(model_path, "repulsion_loss.csv")
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["iteration", "repulsion_loss"])
+        writer.writerows(zip(iters, values))
+
+    # Plot
+    plt.figure(figsize=(10, 5))
+    plt.plot(iters, values, linewidth=0.8)
+    plt.xlabel("iteration")
+    plt.ylabel("repulsion loss (Lrps)")
+    plt.title("Repulsion loss over training")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    png_path = os.path.join(model_path, "repulsion_loss.png")
+    plt.savefig(png_path, dpi=150)
+    plt.close()
+    print(f"\n[plot] Repulsion loss curve saved to {png_path}")
+
+def prepare_output_and_logger(args):
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
             unique_str=os.getenv('OAR_JOB_ID')
@@ -329,8 +413,8 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 15_000, 30_000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 15_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
