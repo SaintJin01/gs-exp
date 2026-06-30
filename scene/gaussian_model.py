@@ -59,10 +59,12 @@ class GaussianModel:
         self._opacity = torch.empty(0)
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
+        self.canceled_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
+        self.model_path = None
         self.setup_functions()
 
     def capture(self):
@@ -76,6 +78,7 @@ class GaussianModel:
             self._opacity,
             self.max_radii2D,
             self.xyz_gradient_accum,
+            self.canceled_gradient_accum,
             self.denom,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
@@ -89,13 +92,15 @@ class GaussianModel:
         self._scaling, 
         self._rotation, 
         self._opacity,
-        self.max_radii2D, 
-        xyz_gradient_accum, 
+        self.max_radii2D,
+        xyz_gradient_accum,
+        canceled_gradient_accum,
         denom,
-        opt_dict, 
+        opt_dict,
         self.spatial_lr_scale) = model_args
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
+        self.canceled_gradient_accum = canceled_gradient_accum
         self.denom = denom
         self.optimizer.load_state_dict(opt_dict)
 
@@ -178,6 +183,9 @@ class GaussianModel:
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        # Accumulates the 2D gradient *vector* so opposing steps cancel out;
+        # its norm reflects the net displacement, unlike xyz_gradient_accum (sum of magnitudes).
+        self.canceled_gradient_accum = torch.zeros((self.get_xyz.shape[0], 2), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
         l = [
@@ -236,16 +244,20 @@ class GaussianModel:
             l.append('rot_{}'.format(i))
         return l
 
-    def save_ply(self, path):
+    def save_ply(self, path, mask=None):
         mkdir_p(os.path.dirname(path))
 
-        xyz = self._xyz.detach().cpu().numpy()
+        if mask is not None:
+            mask = mask.detach().cpu().numpy()
+        sel = (lambda a: a) if mask is None else (lambda a: a[mask])
+
+        xyz = sel(self._xyz.detach().cpu().numpy())
         normals = np.zeros_like(xyz)
-        f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
-        f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
-        opacities = self._opacity.detach().cpu().numpy()
-        scale = self._scaling.detach().cpu().numpy()
-        rotation = self._rotation.detach().cpu().numpy()
+        f_dc = sel(self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy())
+        f_rest = sel(self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy())
+        opacities = sel(self._opacity.detach().cpu().numpy())
+        scale = sel(self._scaling.detach().cpu().numpy())
+        rotation = sel(self._rotation.detach().cpu().numpy())
 
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
@@ -358,6 +370,7 @@ class GaussianModel:
         self._rotation = optimizable_tensors["rotation"]
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
+        self.canceled_gradient_accum = self.canceled_gradient_accum[valid_points_mask]
 
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
@@ -403,6 +416,7 @@ class GaussianModel:
 
         self.tmp_radii = torch.cat((self.tmp_radii, new_tmp_radii))
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.canceled_gradient_accum = torch.zeros((self.get_xyz.shape[0], 2), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
@@ -449,11 +463,43 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii)
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii):
+    def prune_by_cancellation_ratio(self, grads, canceled_grads, prune_ratio_percentile, iteration=None):
+        # grads:          abs gradient (sum of per-step magnitudes, denom-averaged)
+        # canceled_grads: net gradient magnitude (vector sum, denom-averaged)
+        # High abs/canceled ratio => point oscillates back and forth without net progress.
+        valid = (self.denom.squeeze() > 0) & (canceled_grads.squeeze() > 0)
+        if valid.any():
+            ratio = torch.zeros(grads.shape[0], device=grads.device)
+            ratio[valid] = grads.squeeze()[valid] / canceled_grads.squeeze()[valid]
+            thresh = float(np.percentile(ratio[valid].detach().cpu().numpy(), prune_ratio_percentile))
+
+            # require abs_grad magnitude itself to also be in the top (100 - percentile)%
+            # abs_mag = grads.squeeze()
+            # abs_thresh = float(np.percentile(abs_mag[valid].detach().cpu().numpy(), prune_ratio_percentile))
+
+            high_ratio_mask = valid & (ratio >= thresh)
+            # & (abs_mag >= abs_thresh)
+            if high_ratio_mask.any():
+                # save the gaussians that are about to be pruned (top n% ratio)
+                prune_dir = os.path.join(self.model_path if self.model_path else "output", "pruned_points")
+                suffix = f"{iteration:06d}" if iteration is not None else "latest"
+                self.save_ply(os.path.join(prune_dir, f"pruned_{suffix}.ply"), mask=high_ratio_mask)
+
+                keep = ~high_ratio_mask
+                self.prune_points(high_ratio_mask)
+                grads = grads[keep]
+                canceled_grads = canceled_grads[keep]
+        return grads, canceled_grads
+
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii, iteration=None, prune_ratio_percentile=None):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
+        canceled_grads = torch.norm(self.canceled_gradient_accum, dim=-1, keepdim=True) / self.denom
+        canceled_grads[canceled_grads.isnan()] = 0.0
 
         self.tmp_radii = radii
+        if prune_ratio_percentile is not None:
+            grads, canceled_grads = self.prune_by_cancellation_ratio(grads, canceled_grads, prune_ratio_percentile, iteration)
         self.densify_and_clone(grads, max_grad, extent)
         self.densify_and_split(grads, max_grad, extent)
 
@@ -468,6 +514,23 @@ class GaussianModel:
 
         torch.cuda.empty_cache()
 
+    @property
+    def get_abs_grad(self):
+        """Mean per-step gradient magnitude (abs) per point, shape (N, 1)."""
+        grad = self.xyz_gradient_accum / self.denom
+        grad[grad.isnan()] = 0.0
+        return grad
+
+    @property
+    def get_canceled_grad(self):
+        """Magnitude of the mean net (cancelled) gradient per point, shape (N, 1)."""
+        grad = torch.norm(self.canceled_gradient_accum, dim=-1, keepdim=True) / self.denom
+        grad[grad.isnan()] = 0.0
+        return grad
+
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
+        # abs: sum of per-step gradient magnitudes
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
+        # canceled: sum of per-step gradient vectors (opposing directions cancel)
+        self.canceled_gradient_accum[update_filter] += viewspace_point_tensor.grad[update_filter,:2]
         self.denom[update_filter] += 1

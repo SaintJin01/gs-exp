@@ -49,6 +49,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
+    gaussians.model_path = scene.model_path
     gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
@@ -172,7 +173,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
+                    prune_ratio_percentile = opt.abs_prune_percentile if opt.abs_prune_percentile > 0 else None
+                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii,
+                                                iteration=iteration, prune_ratio_percentile=prune_ratio_percentile)
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
