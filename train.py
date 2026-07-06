@@ -49,6 +49,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
+    # Add a dense background sphere of extra primitives before the optimizer is built
+    if opt.add_background_dome and not checkpoint:
+        gaussians.add_background_sphere(opt.background_num_points,
+                                        opt.background_dist_percentile,
+                                        opt.background_radius_scale)
     gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
@@ -68,9 +73,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
 
+    # Colour-only warm-up: for the first N iters only new background primitives' colour is optimized
+    warmup_iters = opt.color_warmup_iters if (opt.add_background_dome and not checkpoint) else 0
+
+    def set_color_lr(f_dc_lr):
+        for pg in gaussians.optimizer.param_groups:
+            if pg["name"] == "f_dc":
+                pg["lr"] = f_dc_lr
+            elif pg["name"] == "f_rest":
+                pg["lr"] = f_dc_lr / 20.0
+
+    # Boost colour LR during warm-up so the sparse, intermittently-visible dome colours converge fast
+    if warmup_iters > 0:
+        set_color_lr(opt.color_warmup_lr)
+
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):
+        in_warmup = iteration <= warmup_iters
+        # Restore the normal colour LR once the warm-up is over
+        if warmup_iters > 0 and iteration == warmup_iters + 1:
+            set_color_lr(opt.feature_lr)
         if network_gui.conn == None:
             network_gui.try_connect()
         while network_gui.conn != None:
@@ -164,8 +187,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
-            # Densification
-            if iteration < opt.densify_until_iter:
+            # Densification (skipped entirely during the colour-only warm-up)
+            if not in_warmup and iteration < opt.densify_until_iter:
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
@@ -179,8 +202,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             # Optimizer step
             if iteration < opt.iterations:
-                gaussians.exposure_optimizer.step()
-                gaussians.exposure_optimizer.zero_grad(set_to_none = True)
+                # During warm-up keep all grads except new-primitive colour zeroed, and freeze exposure
+                if in_warmup:
+                    gaussians.freeze_non_background_color_grads()
+                else:
+                    gaussians.exposure_optimizer.step()
+                    gaussians.exposure_optimizer.zero_grad(set_to_none = True)
                 if use_sparse_adam:
                     visible = radii > 0
                     gaussians.optimizer.step(visible, radii.shape[0])

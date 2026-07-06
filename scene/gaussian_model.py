@@ -10,6 +10,7 @@
 #
 
 import torch
+import math
 import numpy as np
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
 from torch import nn
@@ -63,6 +64,7 @@ class GaussianModel:
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
+        self.num_background_points = 0
         self.setup_functions()
 
     def capture(self):
@@ -174,6 +176,69 @@ class GaussianModel:
         self.pretrained_exposures = None
         exposure = torch.eye(3, 4, device="cuda")[None].repeat(len(cam_infos), 1, 1)
         self._exposure = nn.Parameter(exposure.requires_grad_(True))
+
+    def add_background_sphere(self, num_points, dist_percentile=99.0, radius_scale=1.0):
+        """Add a dense spherical shell of primitives around the scene to fill the
+        far background. The radius is set by the distance of the farthest
+        (top 1% by default) initial points from the scene center."""
+        xyz = self._xyz.detach()
+        center = xyz.mean(dim=0)
+        dists = torch.norm(xyz - center, dim=1)
+        radius = torch.quantile(dists, dist_percentile / 100.0).item() * radius_scale
+
+        # Even, dense distribution over the full sphere (Fibonacci sphere)
+        n = int(num_points)
+        idx = torch.arange(n, dtype=torch.float, device="cuda")
+        golden = math.pi * (3.0 - math.sqrt(5.0))
+        y = 1.0 - 2.0 * (idx + 0.5) / n
+        r = torch.sqrt(torch.clamp(1.0 - y * y, min=0.0))
+        theta = golden * idx
+        dirs = torch.stack([torch.cos(theta) * r, y, torch.sin(theta) * r], dim=1)
+        new_xyz = center + dirs * radius
+
+        # Scale from local spacing on the sphere
+        dist2 = torch.clamp_min(distCUDA2(new_xyz.float().contiguous()), 0.0000001)
+        new_scaling = torch.log(torch.sqrt(dist2))[..., None].repeat(1, 3)
+        new_rotation = torch.zeros((n, 4), device="cuda")
+        new_rotation[:, 0] = 1
+        new_opacity = self.inverse_opacity_activation(0.1 * torch.ones((n, 1), dtype=torch.float, device="cuda"))
+
+        # Neutral gray colour; refined during the colour-only warm-up
+        features = torch.zeros((n, 3, (self.max_sh_degree + 1) ** 2), device="cuda")
+        features[:, :3, 0] = RGB2SH(0.5 * torch.ones((n, 3), device="cuda"))
+        new_features_dc = features[:, :, 0:1].transpose(1, 2).contiguous()
+        new_features_rest = features[:, :, 1:].transpose(1, 2).contiguous()
+
+        self._xyz = nn.Parameter(torch.cat((self._xyz.detach(), new_xyz), dim=0).requires_grad_(True))
+        self._features_dc = nn.Parameter(torch.cat((self._features_dc.detach(), new_features_dc), dim=0).requires_grad_(True))
+        self._features_rest = nn.Parameter(torch.cat((self._features_rest.detach(), new_features_rest), dim=0).requires_grad_(True))
+        self._scaling = nn.Parameter(torch.cat((self._scaling.detach(), new_scaling), dim=0).requires_grad_(True))
+        self._rotation = nn.Parameter(torch.cat((self._rotation.detach(), new_rotation), dim=0).requires_grad_(True))
+        self._opacity = nn.Parameter(torch.cat((self._opacity.detach(), new_opacity), dim=0).requires_grad_(True))
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        self.num_background_points = n
+        print(f"Added {n} background sphere primitives at radius {radius:.4f} (center {center.tolist()})")
+
+    def get_background_mask(self):
+        """Boolean mask marking the appended background primitives (the last N points).
+        Valid only before any densification reorders/changes the point set."""
+        n_total = self.get_xyz.shape[0]
+        mask = torch.zeros(n_total, dtype=torch.bool, device="cuda")
+        if self.num_background_points > 0:
+            mask[n_total - self.num_background_points:] = True
+        return mask
+
+    def freeze_non_background_color_grads(self):
+        """Zero every gradient except the SH colour of the background primitives,
+        so the optimizer step only updates new-primitive colour during warm-up."""
+        bg = self.get_background_mask()
+        for p in (self._xyz, self._scaling, self._rotation, self._opacity):
+            if p.grad is not None:
+                p.grad.zero_()
+        if self._features_dc.grad is not None:
+            self._features_dc.grad[~bg] = 0
+        if self._features_rest.grad is not None:
+            self._features_rest.grad[~bg] = 0
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
