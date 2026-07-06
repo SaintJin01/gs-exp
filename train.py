@@ -10,6 +10,7 @@
 #
 
 import os
+import re
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim
@@ -68,6 +69,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
 
+    # Cameras sorted by numeric name for sequential-view training (1, 2, ..., N)
+    def _cam_order_key(cam):
+        nums = re.findall(r"\d+", cam.image_name)
+        return (int(nums[-1]) if nums else 0, cam.image_name)
+    sequential_cameras = sorted(scene.getTrainCameras(), key=_cam_order_key)
+    seq_ptr = 0
+
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):
@@ -94,13 +102,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
 
-        # Pick a random Camera
-        if not viewpoint_stack:
-            viewpoint_stack = scene.getTrainCameras().copy()
-            viewpoint_indices = list(range(len(viewpoint_stack)))
-        rand_idx = randint(0, len(viewpoint_indices) - 1)
-        viewpoint_cam = viewpoint_stack.pop(rand_idx)
-        vind = viewpoint_indices.pop(rand_idx)
+        # Alternate between sequential-view and random-view training every view_toggle_interval iters
+        sequential_mode = ((iteration - 1) // opt.view_toggle_interval) % 2 == 1
+        if sequential_mode:
+            # Pick the next Camera in numeric order (wraps around)
+            viewpoint_cam = sequential_cameras[seq_ptr % len(sequential_cameras)]
+            seq_ptr += 1
+        else:
+            # Pick a random Camera
+            if not viewpoint_stack:
+                viewpoint_stack = scene.getTrainCameras().copy()
+                viewpoint_indices = list(range(len(viewpoint_stack)))
+            rand_idx = randint(0, len(viewpoint_indices) - 1)
+            viewpoint_cam = viewpoint_stack.pop(rand_idx)
+            vind = viewpoint_indices.pop(rand_idx)
 
         # Render
         if (iteration - 1) == debug_from:
