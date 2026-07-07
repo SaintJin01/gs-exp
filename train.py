@@ -10,6 +10,9 @@
 #
 
 import os
+import re
+import json
+import random
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim
@@ -40,7 +43,8 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from,
+             view_sequence_seed=None, view_sequence_file=None):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
@@ -68,6 +72,29 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
 
+    # Optional fixed view sequence: train by cycling through a permutation of the views
+    # in a canonical (numeric-name) order, instead of random sampling.
+    view_sequence = None
+    sequence_cameras = None
+    seq_ptr = 0
+    if view_sequence_seed is not None or view_sequence_file is not None:
+        def _cam_order_key(cam):
+            nums = re.findall(r"\d+", cam.image_name)
+            return (int(nums[-1]) if nums else 0, cam.image_name)
+        sequence_cameras = sorted(scene.getTrainCameras(), key=_cam_order_key)
+        n_views = len(sequence_cameras)
+        if view_sequence_file is not None:
+            with open(view_sequence_file) as f:
+                data = json.load(f)
+            view_sequence = data["sequence"] if isinstance(data, dict) else data
+        else:
+            rng = random.Random(view_sequence_seed)
+            view_sequence = list(range(n_views))
+            rng.shuffle(view_sequence)
+        with open(os.path.join(scene.model_path, "view_sequence.json"), "w") as f:
+            json.dump({"seed": view_sequence_seed, "num_views": n_views, "sequence": view_sequence}, f)
+        print(f"[view-sequence] using fixed order over {n_views} views (seed={view_sequence_seed})")
+
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):
@@ -94,13 +121,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
 
-        # Pick a random Camera
-        if not viewpoint_stack:
-            viewpoint_stack = scene.getTrainCameras().copy()
-            viewpoint_indices = list(range(len(viewpoint_stack)))
-        rand_idx = randint(0, len(viewpoint_indices) - 1)
-        viewpoint_cam = viewpoint_stack.pop(rand_idx)
-        vind = viewpoint_indices.pop(rand_idx)
+        if view_sequence is not None:
+            # Pick the next Camera from the fixed sequence (wraps around)
+            viewpoint_cam = sequence_cameras[view_sequence[seq_ptr % len(view_sequence)]]
+            seq_ptr += 1
+        else:
+            # Pick a random Camera
+            if not viewpoint_stack:
+                viewpoint_stack = scene.getTrainCameras().copy()
+                viewpoint_indices = list(range(len(viewpoint_stack)))
+            rand_idx = randint(0, len(viewpoint_indices) - 1)
+            viewpoint_cam = viewpoint_stack.pop(rand_idx)
+            vind = viewpoint_indices.pop(rand_idx)
 
         # Render
         if (iteration - 1) == debug_from:
@@ -271,6 +303,8 @@ if __name__ == "__main__":
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--view_sequence_seed", type=int, default=None)
+    parser.add_argument("--view_sequence_file", type=str, default=None)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
@@ -283,7 +317,8 @@ if __name__ == "__main__":
     if not args.disable_viewer:
         network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from,
+             view_sequence_seed=args.view_sequence_seed, view_sequence_file=args.view_sequence_file)
 
     # All done
     print("\nTraining complete.")
