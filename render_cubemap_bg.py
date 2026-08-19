@@ -29,17 +29,23 @@ except:
 
 
 def render_set(model_path, name, iteration, views, gaussians, pipeline, cubemap, train_test_exp, separate_sh):
-    render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders_cubemap")
+    render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
+    gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
+
     makedirs(render_path, exist_ok=True)
+    makedirs(gts_path, exist_ok=True)
 
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
         background = cubemap.background_for_view(view)
         composite = render(view, gaussians, pipeline, background, use_trained_exp=train_test_exp, separate_sh=separate_sh)["render"]
+        gt = view.original_image[0:3, :, :]
 
         if train_test_exp:
             composite = composite[..., composite.shape[-1] // 2:]
+            gt = gt[..., gt.shape[-1] // 2:]
 
         torchvision.utils.save_image(composite, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
+        torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
 
 
 def render_sets(dataset, iteration, pipeline, skip_train, skip_test, separate_sh, cubemap_dir):
