@@ -11,7 +11,7 @@ from scene import Scene
 from utils.general_utils import safe_state
 from exp_utils.heightfield_bg import CubemapBackground
 
-DEFAULT_CUBEMAP = "/home/sj/work/gs-dataset/tandt/train/cubemaps/ablation_01_sky_border_4096_gt25m"
+DEFAULT_CUBEMAP = "/home/sj/work/gs-dataset/tandt/train/cubemaps/ade20k_tree_exclude_2k_patch_consensus"
 
 
 def main():

@@ -19,9 +19,8 @@
 
 import os
 import torch
-import torchvision
 from random import randint
-from utils.loss_utils import l1_loss, ssim
+from utils.loss_utils import l1_loss, masked_l1_loss, masked_ssim, ssim
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -67,23 +66,7 @@ class CachedCubemapBackground:
         return self.cache[key].cuda().float() / 255.0
 
 
-def dump_loss_maps(model_path, iteration, views, gaussians, pipe, cubemap_bg, train_test_exp, separate_sh):
-    """[CUBEMAP] Save per-pixel L1 loss maps (composite vs GT) for every view.
-
-    Grayscale PNGs on an absolute scale (255 = L1 of 1.0), comparable across iterations.
-    """
-    out_dir = os.path.join(model_path, "loss_maps", "iter_{:06d}".format(iteration))
-    os.makedirs(out_dir, exist_ok=True)
-    for view in views:
-        bg = cubemap_bg(view)
-        image = render(view, gaussians, pipe, bg, use_trained_exp=train_test_exp, separate_sh=separate_sh)["render"]
-        gt_image = view.original_image.cuda()
-        loss_map = (image - gt_image).abs().mean(dim=0, keepdim=True).clamp(0.0, 1.0)
-        torchvision.utils.save_image(loss_map, os.path.join(out_dir, view.image_name + ".png"))
-    print("\n[ITER {}] Saved {} loss maps to {}".format(iteration, len(views), out_dir))
-
-
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, cubemap_dir, loss_map_interval, loss_map_until):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, cubemap_dir):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
@@ -169,11 +152,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
-        Ll1 = l1_loss(image, gt_image)
-        if FUSED_SSIM_AVAILABLE:
-            ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
-        else:
-            ssim_value = ssim(image, gt_image)
+        loss_mask = viewpoint_cam.loss_mask.cuda()
+        Ll1 = masked_l1_loss(image, gt_image, loss_mask)
+        # A scalar fused SSIM cannot exclude invalid pixels or their window
+        # statistics, so compensated images always use the masked version.
+        ssim_value = masked_ssim(image, gt_image, loss_mask)
 
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
@@ -214,10 +197,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
-
-            # [CUBEMAP] Periodic per-view L1 loss maps over all train views.
-            if loss_map_interval > 0 and iteration % loss_map_interval == 0 and iteration <= loss_map_until:
-                dump_loss_maps(dataset.model_path, iteration, scene.getTrainCameras(), gaussians, pipe, cubemap_bg, dataset.train_test_exp, SPARSE_ADAM_AVAILABLE)
 
             # Densification
             if iteration < opt.densify_until_iter:
@@ -292,12 +271,17 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                     if train_test_exp:
                         image = image[..., image.shape[-1] // 2:]
                         gt_image = gt_image[..., gt_image.shape[-1] // 2:]
+                        valid = viewpoint.loss_mask.to("cuda")[..., viewpoint.loss_mask.shape[-1] // 2:]
+                    else:
+                        valid = viewpoint.loss_mask.to("cuda")
                     if tb_writer and (idx < 5):
                         tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
                         if iteration == testing_iterations[0]:
                             tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
-                    l1_test += l1_loss(image, gt_image).mean().double()
-                    psnr_test += psnr(image, gt_image).mean().double()
+                    l1_test += masked_l1_loss(image, gt_image, valid).double()
+                    squared = ((image - gt_image).square() * valid).sum()
+                    mse = squared / (valid.sum().clamp_min(1) * image.shape[0])
+                    psnr_test += (-10.0 * torch.log10(mse.clamp_min(1e-12))).double()
                 psnr_test /= len(config['cameras'])
                 l1_test /= len(config['cameras'])
                 print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
@@ -330,10 +314,6 @@ if __name__ == "__main__":
     parser.add_argument("--cubemap", type=str, default="",
                         help="Cubemap directory with posx..negz.png and meta.json "
                              "(default: <source_path>/cubemaps/cubemap)")
-    parser.add_argument("--loss_map_interval", type=int, default=500,
-                        help="Dump per-view L1 loss maps every N iterations (0 disables).")
-    parser.add_argument("--loss_map_until", type=int, default=3000,
-                        help="Stop dumping loss maps after this iteration.")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
 
@@ -346,7 +326,7 @@ if __name__ == "__main__":
     if not args.disable_viewer:
         network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.cubemap, args.loss_map_interval, args.loss_map_until)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.cubemap)
 
     # All done
     print("\nTraining complete.")

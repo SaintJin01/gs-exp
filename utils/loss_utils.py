@@ -43,6 +43,42 @@ def l1_loss(network_output, gt):
 def l2_loss(network_output, gt):
     return ((network_output - gt) ** 2).mean()
 
+def masked_l1_loss(network_output, gt, mask):
+    """Mean absolute RGB error over valid pixels only."""
+    valid = mask.to(dtype=network_output.dtype, device=network_output.device)
+    if valid.ndim == network_output.ndim - 1:
+        valid = valid.unsqueeze(-3)
+    numerator = (torch.abs(network_output - gt) * valid).sum()
+    denominator = valid.sum().clamp_min(1.0) * network_output.shape[-3]
+    return numerator / denominator
+
+def masked_ssim(img1, img2, mask, window_size=11):
+    """SSIM whose local moments and final average ignore invalid pixels."""
+    if img1.ndim == 3:
+        img1, img2 = img1.unsqueeze(0), img2.unsqueeze(0)
+    if mask.ndim == 3:
+        mask = mask.unsqueeze(0)
+    mask = mask.to(dtype=img1.dtype, device=img1.device)
+    channel = img1.shape[1]
+    window = create_window(window_size, 1).to(device=img1.device, dtype=img1.dtype)
+    norm = F.conv2d(mask, window, padding=window_size // 2).clamp_min(1e-8)
+
+    def average(value):
+        kernel = window.expand(channel, 1, window_size, window_size)
+        return F.conv2d(value * mask, kernel, padding=window_size // 2,
+                        groups=channel) / norm
+
+    mu1, mu2 = average(img1), average(img2)
+    mu1_sq, mu2_sq, mu1_mu2 = mu1.square(), mu2.square(), mu1 * mu2
+    sigma1_sq = (average(img1.square()) - mu1_sq).clamp_min(0.0)
+    sigma2_sq = (average(img2.square()) - mu2_sq).clamp_min(0.0)
+    sigma12 = average(img1 * img2) - mu1_mu2
+    score = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / (
+        (mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2)
+    )
+    valid_centres = mask.expand(-1, channel, -1, -1)
+    return (score * valid_centres).sum() / valid_centres.sum().clamp_min(1.0)
+
 def gaussian(window_size, sigma):
     gauss = torch.Tensor([exp(-(x - window_size // 2) ** 2 / float(2 * sigma ** 2)) for x in range(window_size)])
     return gauss / gauss.sum()

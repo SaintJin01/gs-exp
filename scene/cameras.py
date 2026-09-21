@@ -54,6 +54,10 @@ class Camera(nn.Module):
                 self.alpha_mask[..., self.alpha_mask.shape[-1] // 2:] = 0
 
         self.original_image = gt_image.clamp(0.0, 1.0).to(self.data_device)
+        # Radiance compensation stores saturated/invalid observations as exact
+        # black.  Keep them visible for debugging, but never supervise from them.
+        self.loss_mask = (self.original_image.amax(dim=0, keepdim=True) > 0.0)
+        self.loss_mask &= self.alpha_mask > 0.0
         self.image_width = self.original_image.shape[2]
         self.image_height = self.original_image.shape[1]
 
