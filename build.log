@@ -1,0 +1,12 @@
+Processing ./submodules/diff-gaussian-rasterization
+  Preparing metadata (setup.py): started
+  Preparing metadata (setup.py): finished with status 'done'
+Building wheels for collected packages: diff-gaussian-rasterization
+  Building wheel for diff-gaussian-rasterization (setup.py): started
+  Building wheel for diff-gaussian-rasterization (setup.py): finished with status 'done'
+  Created wheel for diff-gaussian-rasterization: filename=diff_gaussian_rasterization-0.0.0-cp37-cp37m-linux_x86_64.whl size=1846701 sha256=b79bbdc559ea483baaf3a879baade0a1a4f4f0b9b612775d75d4e10e33636469
+  Stored in directory: /home/sj/.cache/pip/wheels/6b/91/cb/13567c61edb3e83db49bb412bd9ca4f9a9b7e6c55adf7f40d8
+Successfully built diff-gaussian-rasterization
+Installing collected packages: diff-gaussian-rasterization
+Successfully installed diff-gaussian-rasterization-0.0.0
+WARNING: There was an error checking the latest version of pip.
