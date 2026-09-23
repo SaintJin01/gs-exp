@@ -20,7 +20,7 @@ from utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
-from utils.graphics_utils import BasicPointCloud
+from utils.graphics_utils import BasicPointCloud, fov2focal
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 
 try:
@@ -64,7 +64,6 @@ class GaussianModel:
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
-        self.num_background_points = 0
         self.setup_functions()
 
     def capture(self):
@@ -135,6 +134,14 @@ class GaussianModel:
     def get_exposure(self):
         return self._exposure
 
+    @property
+    def get_means3D(self):
+        return self.get_xyz
+
+    @property
+    def get_render_scaling(self):
+        return self.get_scaling
+
     def get_exposure_from_name(self, image_name):
         if self.pretrained_exposures is None:
             return self._exposure[self.exposure_mapping[image_name]]
@@ -176,69 +183,6 @@ class GaussianModel:
         self.pretrained_exposures = None
         exposure = torch.eye(3, 4, device="cuda")[None].repeat(len(cam_infos), 1, 1)
         self._exposure = nn.Parameter(exposure.requires_grad_(True))
-
-    def add_background_sphere(self, num_points, dist_percentile=99.0, radius_scale=1.0):
-        """Add a dense spherical shell of primitives around the scene to fill the
-        far background. The radius is set by the distance of the farthest
-        (top 1% by default) initial points from the scene center."""
-        xyz = self._xyz.detach()
-        center = xyz.mean(dim=0)
-        dists = torch.norm(xyz - center, dim=1)
-        radius = torch.quantile(dists, dist_percentile / 100.0).item() * radius_scale
-
-        # Even, dense distribution over the full sphere (Fibonacci sphere)
-        n = int(num_points)
-        idx = torch.arange(n, dtype=torch.float, device="cuda")
-        golden = math.pi * (3.0 - math.sqrt(5.0))
-        y = 1.0 - 2.0 * (idx + 0.5) / n
-        r = torch.sqrt(torch.clamp(1.0 - y * y, min=0.0))
-        theta = golden * idx
-        dirs = torch.stack([torch.cos(theta) * r, y, torch.sin(theta) * r], dim=1)
-        new_xyz = center + dirs * radius
-
-        # Scale from local spacing on the sphere
-        dist2 = torch.clamp_min(distCUDA2(new_xyz.float().contiguous()), 0.0000001)
-        new_scaling = torch.log(torch.sqrt(dist2))[..., None].repeat(1, 3)
-        new_rotation = torch.zeros((n, 4), device="cuda")
-        new_rotation[:, 0] = 1
-        new_opacity = self.inverse_opacity_activation(0.1 * torch.ones((n, 1), dtype=torch.float, device="cuda"))
-
-        # Neutral gray colour; refined during the colour-only warm-up
-        features = torch.zeros((n, 3, (self.max_sh_degree + 1) ** 2), device="cuda")
-        features[:, :3, 0] = RGB2SH(0.5 * torch.ones((n, 3), device="cuda"))
-        new_features_dc = features[:, :, 0:1].transpose(1, 2).contiguous()
-        new_features_rest = features[:, :, 1:].transpose(1, 2).contiguous()
-
-        self._xyz = nn.Parameter(torch.cat((self._xyz.detach(), new_xyz), dim=0).requires_grad_(True))
-        self._features_dc = nn.Parameter(torch.cat((self._features_dc.detach(), new_features_dc), dim=0).requires_grad_(True))
-        self._features_rest = nn.Parameter(torch.cat((self._features_rest.detach(), new_features_rest), dim=0).requires_grad_(True))
-        self._scaling = nn.Parameter(torch.cat((self._scaling.detach(), new_scaling), dim=0).requires_grad_(True))
-        self._rotation = nn.Parameter(torch.cat((self._rotation.detach(), new_rotation), dim=0).requires_grad_(True))
-        self._opacity = nn.Parameter(torch.cat((self._opacity.detach(), new_opacity), dim=0).requires_grad_(True))
-        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
-        self.num_background_points = n
-        print(f"Added {n} background sphere primitives at radius {radius:.4f} (center {center.tolist()})")
-
-    def get_background_mask(self):
-        """Boolean mask marking the appended background primitives (the last N points).
-        Valid only before any densification reorders/changes the point set."""
-        n_total = self.get_xyz.shape[0]
-        mask = torch.zeros(n_total, dtype=torch.bool, device="cuda")
-        if self.num_background_points > 0:
-            mask[n_total - self.num_background_points:] = True
-        return mask
-
-    def freeze_non_background_color_grads(self):
-        """Zero every gradient except the SH colour of the background primitives,
-        so the optimizer step only updates new-primitive colour during warm-up."""
-        bg = self.get_background_mask()
-        for p in (self._xyz, self._scaling, self._rotation, self._opacity):
-            if p.grad is not None:
-                p.grad.zero_()
-        if self._features_dc.grad is not None:
-            self._features_dc.grad[~bg] = 0
-        if self._features_rest.grad is not None:
-            self._features_rest.grad[~bg] = 0
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
@@ -536,3 +480,169 @@ class GaussianModel:
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
+
+class BackgroundGaussianModel(GaussianModel):
+
+    def setup_functions(self):
+        super().setup_functions()
+        self.w_inverse_activation = torch.log
+    
+    def __init__(self, sh_degree, optimizer_type="default"):
+        super().__init__(sh_degree, optimizer_type)
+        self._w = torch.empty(0)
+        self.background_center = torch.zeros(3)
+
+    def capture(self):
+        parent_state = super().capture()
+        return (parent_state, self._w, self.background_center)
+    
+    def restore(self, model_args, training_args):
+        (parent_state, self._w, self.background_center) = model_args
+        super().restore( parent_state, training_args )
+
+    def save_ply(self, path):
+        mkdir_p(os.path.dirname(path))
+
+        xyz = self.get_means3D.detach().cpu().numpy()
+        scaling = (torch.log(self.get_render_scaling).detach().cpu().numpy())
+        normals = np.zeros_like(xyz)
+        f_dc = (self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy())
+        f_rest = (self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy())
+        opacities = self._opacity.detach().cpu().numpy()
+        rotation = self._rotation.detach().cpu().numpy()
+
+        dtype_full = [(attribute, "f4") for attribute in self.construct_list_of_attributes()]
+        elements = np.empty(xyz.shape[0], dtype=dtype_full)
+        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scaling, rotation), axis=1)
+        elements[:] = list(map(tuple, attributes))
+        element = PlyElement.describe(elements, "vertex")
+
+        PlyData([element]).write(path)
+        
+    @property
+    def get_w(self):
+        w = torch.exp(self._w)
+        return w
+
+    @property
+    def get_w_inv(self):
+        w = torch.exp(self._w)
+        return 1 / w
+
+    @property
+    def get_means3D(self):
+        means3D = self.background_center.unsqueeze(0) + self.get_xyz * self.get_w_inv.unsqueeze(1)
+        return means3D
+
+    @property
+    def get_points_hom(self):
+        xyz = self.get_xyz
+        points_hom = torch.stack([xyz[:, 0], xyz[:, 1], xyz[:, 2], self.get_w], dim=1)
+        return points_hom
+
+    @property
+    def get_render_scaling(self):
+        return self.get_scaling * self.get_w_inv.unsqueeze(1)
+
+    def get_covariance(self, scaling_modifier=1):
+        return self.covariance_activation(self.get_scaling * self.get_w_inv.unsqueeze(1), scaling_modifier,
+                                          self._rotation)
+
+    def initialize(self, cameras, num_bgaussians):
+        # background center
+        camera_centers = torch.stack([camera.camera_center for camera in cameras], dim=0)
+        self.background_center = torch.mean(camera_centers, dim=0).detach()
+
+        # maximum camera distance
+        max_camera_dist = torch.cdist(camera_centers, camera_centers).max()
+
+        # maximum focal length
+        focal_lengths = []
+        for camera in cameras:
+            focal_lengths.append(max(fov2focal(camera.FoVx, camera.image_width), 
+                                     fov2focal(camera.FoVy, camera.image_height)))
+        max_focal_length = max(focal_lengths)
+
+        # get initial background depth without parallax
+        radius = max_focal_length * max_camera_dist.item() / 0.5
+
+        # fibonacci sphere
+        idx = torch.arange(num_bgaussians, dtype=torch.float, device="cuda")
+        golden = math.pi * (3.0 - math.sqrt(5.0))
+        y = 1.0 - 2.0 * (idx + 0.5) / num_bgaussians
+        r = torch.sqrt(torch.clamp(1.0 - y * y, min=0.0))
+        theta = golden * idx
+        directions = torch.nn.functional.normalize(torch.stack([torch.cos(theta) * r, y, torch.sin(theta) * r], dim=1), dim=1,)
+        
+        # xyzw
+        xyz = directions.contiguous().float().cuda()
+        w = torch.full((num_bgaussians,), math.log(1.0 / radius)).float().cuda()
+        # scaling
+        angular_spacing = math.sqrt(4.0 * math.pi / num_bgaussians)
+        homogeneous_sigma = max(angular_spacing * 1.0, 1e-6) # scale overlap: 1.0
+        scaling = torch.full((num_bgaussians, 3,), math.log(homogeneous_sigma)).float().cuda()
+        # rotation
+        rotations = torch.zeros((num_bgaussians, 4,)).float().cuda()
+        rotations[:, 0] = 1.0
+        # opacity
+        opacity = self.inverse_opacity_activation(torch.full((num_bgaussians, 1,), 0.2)).float().cuda()
+        # SH features
+        rgb = torch.tensor((0.5, 0.5, 0.5)).reshape(1, 3).repeat(num_bgaussians, 1,).float().cuda()
+        sh_dc = RGB2SH(rgb)
+        feature_count = (self.max_sh_degree + 1) ** 2
+        features = torch.zeros((num_bgaussians, 3, feature_count)).float().cuda()
+        features[:, :, 0] = sh_dc
+
+        # set parameter
+        self._xyz = nn.Parameter(xyz.contiguous().requires_grad_(True))
+        self._w = nn.Parameter(w.requires_grad_(True))
+        self._scaling = nn.Parameter(scaling.requires_grad_(True))
+        self._rotation = nn.Parameter(rotations.requires_grad_(True))
+        self._opacity = nn.Parameter(opacity.requires_grad_(True))
+        self._features_dc = nn.Parameter(features[:, :, :1].transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_rest = nn.Parameter(features[:, :, 1:].transpose(1, 2).contiguous().requires_grad_(True))
+        
+        # training state
+        self.active_sh_degree = 0
+        self.spatial_lr_scale = 1.0
+        self.max_radii2D = torch.zeros(num_bgaussians).float().cuda()
+        self.xyz_gradient_accum = torch.zeros((num_bgaussians, 1)).float().cuda()
+        self.denom = torch.zeros((num_bgaussians, 1)).float().cuda()
+
+    def training_setup(self, training_args):
+        self.percent_dense = training_args.percent_dense
+
+        l = [
+            {'params': [self._xyz], 'lr': training_args.background_position_lr_init, "name": "xyz"},
+            {'params': [self._w], 'lr': training_args.background_w_lr_init, "name": "w"},
+            {'params': [self._features_dc], 'lr': training_args.background_feature_lr, "name": "f_dc"},
+            {'params': [self._features_rest], 'lr': training_args.background_feature_lr / 20.0, "name": "f_rest"},
+            {'params': [self._opacity], 'lr': training_args.background_opacity_lr, "name": "opacity"},
+            {'params': [self._scaling], 'lr': training_args.background_scaling_lr, "name": "scaling"},
+            {'params': [self._rotation], 'lr': training_args.background_rotation_lr, "name": "rotation"}
+        ]
+
+        self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+        self.xyz_scheduler_args = get_expon_lr_func(
+            lr_init=training_args.background_position_lr_init,
+            lr_final=training_args.background_position_lr_final,
+            lr_delay_mult=training_args.background_position_lr_delay_mult,
+            max_steps=training_args.background_position_lr_max_steps,
+        )
+        self.w_scheduler_args = get_expon_lr_func(
+            lr_init=training_args.background_w_lr_init,
+            lr_final=training_args.background_w_lr_final,
+            lr_delay_mult=training_args.background_w_lr_delay_mult,
+            max_steps=training_args.background_w_lr_max_steps,
+        )
+
+    def update_learning_rate(self, iteration):
+        xyz_lr = self.xyz_scheduler_args(iteration)
+        w_lr = self.w_scheduler_args(iteration)
+
+        for parameter_group in self.optimizer.param_groups:
+            if parameter_group["name"] == "xyz":
+                parameter_group["lr"] = xyz_lr
+            elif parameter_group["name"] == "w":
+                parameter_group["lr"] = w_lr
+        return {"xyz": xyz_lr, "w": w_lr,}

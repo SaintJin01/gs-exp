@@ -16,6 +16,7 @@ from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
+from scene.gaussian_model import BackgroundGaussianModel
 from utils.general_utils import safe_state, get_expon_lr_func
 import uuid
 from tqdm import tqdm
@@ -40,6 +41,62 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
+def train_bgaussians(scene, dataset, opt, pipe, background):
+    bgaussians = BackgroundGaussianModel(dataset.sh_degree, opt.optimizer_type)
+    train_cameras = scene.getTrainCameras()
+    
+    bgaussians.initialize(train_cameras, opt.background_num_gaussians,)
+    bgaussians.training_setup(opt)
+
+    viewpoint_stack = []
+    progress_bar = tqdm(range(1, opt.background_iterations + 1), desc="Background warm-up")
+
+    for iteration in progress_bar:
+        if network_gui.conn is None:
+            network_gui.try_connect()
+        while network_gui.conn is not None:
+            try:
+                (custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifier) = network_gui.receive()
+                net_image_bytes = None
+                if custom_cam is not None:
+                    net_image = render(custom_cam, bgaussians, pipe, background, scaling_modifier=scaling_modifier, use_trained_exp=False, separate_sh=SPARSE_ADAM_AVAILABLE)["render"]
+                    net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
+                network_gui.send(net_image_bytes, dataset.source_path)
+                if do_training and (iteration < opt.background_iterations or not keep_alive):
+                    break
+            except Exception:
+                network_gui.conn = None
+
+        bgaussians.update_learning_rate(iteration)
+
+        if iteration % 1000 == 0:
+            bgaussians.oneupSHdegree()
+
+        if not viewpoint_stack:
+            viewpoint_stack = train_cameras.copy()
+
+        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
+        render_pkg = render(viewpoint_cam, bgaussians, pipe, background, use_trained_exp=False, separate_sh=SPARSE_ADAM_AVAILABLE)
+        rendered_image = render_pkg["render"]
+        gt_image = viewpoint_cam.original_image.cuda()
+
+        Ll1 = l1_loss(rendered_image, gt_image)
+        if FUSED_SSIM_AVAILABLE:
+            ssim_value = fused_ssim(rendered_image.unsqueeze(0), gt_image.unsqueeze(0))
+        else:
+            ssim_value = ssim(rendered_image, gt_image)
+        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+        loss.backward()
+
+        bgaussians.optimizer.step()
+        bgaussians.optimizer.zero_grad(set_to_none=True)
+
+        if iteration % 10 == 0:
+            progress_bar.set_postfix({"Loss": f"{loss.item():.7f}", "Points": bgaussians.get_xyz.shape[0]})
+
+    return bgaussians
+        
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
@@ -49,18 +106,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
-    # Add a dense background sphere of extra primitives before the optimizer is built
-    if opt.add_background_dome and not checkpoint:
-        gaussians.add_background_sphere(opt.background_num_points,
-                                        opt.background_dist_percentile,
-                                        opt.background_radius_scale)
+
+    bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
+    background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+    bgaussians = train_bgaussians(scene, dataset, opt, pipe, background)
+    # freeze after warm-up (temporal)
+    for parameter in [
+        bgaussians._xyz,
+        bgaussians._w,
+        bgaussians._features_dc,
+        bgaussians._features_rest,
+        bgaussians._opacity,
+        bgaussians._scaling,
+        bgaussians._rotation,
+    ]:
+        parameter.requires_grad_(False)
+    torch.cuda.empty_cache()
+
+    scene.initialize_sfm_gaussians()
     gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
-
-    bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
-    background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
@@ -73,27 +140,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
 
-    # Colour-only warm-up: for the first N iters only new background primitives' colour is optimized
-    warmup_iters = opt.color_warmup_iters if (opt.add_background_dome and not checkpoint) else 0
-
-    def set_color_lr(f_dc_lr):
-        for pg in gaussians.optimizer.param_groups:
-            if pg["name"] == "f_dc":
-                pg["lr"] = f_dc_lr
-            elif pg["name"] == "f_rest":
-                pg["lr"] = f_dc_lr / 20.0
-
-    # Boost colour LR during warm-up so the sparse, intermittently-visible dome colours converge fast
-    if warmup_iters > 0:
-        set_color_lr(opt.color_warmup_lr)
-
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):
-        in_warmup = iteration <= warmup_iters
-        # Restore the normal colour LR once the warm-up is over
-        if warmup_iters > 0 and iteration == warmup_iters + 1:
-            set_color_lr(opt.feature_lr)
         if network_gui.conn == None:
             network_gui.try_connect()
         while network_gui.conn != None:
@@ -101,7 +150,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 net_image_bytes = None
                 custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
                 if custom_cam != None:
-                    net_image = render(custom_cam, gaussians, pipe, background, scaling_modifier=scaling_modifer, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)["render"]
+                    net_image = render(custom_cam, gaussians, pipe, background, scaling_modifier=scaling_modifer, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE, bpc=bgaussians)["render"]
                     net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
                 network_gui.send(net_image_bytes, dataset.source_path)
                 if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
@@ -131,7 +180,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
+        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE, bpc=bgaussians)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
         #if iteration % 100 == 0:
@@ -182,13 +231,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp, bgaussians), dataset.train_test_exp)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
-                scene.save(iteration)
+                scene.save(iteration, bgaussians)
 
             # Densification (skipped entirely during the colour-only warm-up)
-            if not in_warmup and iteration < opt.densify_until_iter:
+            if iteration < opt.densify_until_iter:
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
@@ -203,12 +252,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             # Optimizer step
             if iteration < opt.iterations:
-                # During warm-up keep all grads except new-primitive colour zeroed, and freeze exposure
-                if in_warmup:
-                    gaussians.freeze_non_background_color_grads()
-                else:
-                    gaussians.exposure_optimizer.step()
-                    gaussians.exposure_optimizer.zero_grad(set_to_none = True)
+                gaussians.exposure_optimizer.step()
+                gaussians.exposure_optimizer.zero_grad(set_to_none = True)
                 if use_sparse_adam:
                     visible = radii > 0
                     gaussians.optimizer.step(visible, radii.shape[0])

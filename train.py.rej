@@ -1,0 +1,11 @@
+--- train.py
++++ train.py
+@@ -219,7 +219,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
+             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp, bgaussians), dataset.train_test_exp)
+             if (iteration in saving_iterations):
+                 print("\n[ITER {}] Saving Gaussians".format(iteration))
+-                scene.save(iteration)
++                scene.save(iteration, bgaussians)
+ 
+             # Densification (skipped entirely during the colour-only warm-up)
+             if iteration < opt.densify_until_iter:

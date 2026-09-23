@@ -97,13 +97,24 @@ class OptimizationParams(ParamGroup):
         self.depth_l1_weight_final = 0.01
         self.random_background = False
         self.optimizer_type = "default"
-        # Background dome of extra primitives + colour-only warm-up
-        self.add_background_dome = True
-        self.background_num_points = 100_000
-        self.background_dist_percentile = 99.0
-        self.background_radius_scale = 1.2
-        self.color_warmup_iters = 2000
-        self.color_warmup_lr = 0.05  # boosted f_dc lr during warm-up (feature_lr is 0.0025)
+        # Background Gaussian
+        self.background_num_gaussians = 100_000
+        self.background_iterations = 10_000
+
+        self.background_position_lr_init = 0.0001
+        self.background_position_lr_final = 0.000001
+        self.background_position_lr_delay_mult = 1.0
+        self.background_position_lr_max_steps = 10_000
+
+        self.background_w_lr_init = 0.001
+        self.background_w_lr_final = 0.00001
+        self.background_w_lr_delay_mult = 0.01
+        self.background_w_lr_max_steps = 10_000
+
+        self.background_feature_lr = 0.0025
+        self.background_opacity_lr = 0.01
+        self.background_scaling_lr = 0.001
+        self.background_rotation_lr = 0.0001
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
