@@ -13,6 +13,7 @@ import os
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim
+from utils.background_lossmap import LOSSMAP_ITERATIONS, save_background_lossmaps
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -41,15 +42,36 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
+def masked_l1_loss(rendered_image, gt_image, alpha_mask):
+    valid_mask = alpha_mask > 0.5
+    valid_mask_rgb = valid_mask.expand_as(rendered_image)
+
+    if not valid_mask.any():
+        return None
+
+    absolute_error = torch.abs(rendered_image - gt_image)
+    return absolute_error[valid_mask_rgb].mean()
+
 def train_bgaussians(scene, dataset, opt, pipe, background):
     bgaussians = BackgroundGaussianModel(dataset.sh_degree, opt.optimizer_type)
-    train_cameras = scene.getTrainCameras()
+    train_cameras = scene.getBackgroundTrainCameras()
     
-    bgaussians.initialize(train_cameras, opt.background_num_gaussians,)
+    bgaussians.initialize(train_cameras, opt.background_num_gaussians)
     bgaussians.training_setup(opt)
+
+    # for pruning
+    ever_received_gradient = torch.zeros(bgaussians.get_xyz.shape[0], dtype=torch.bool, device="cuda")
 
     viewpoint_stack = []
     progress_bar = tqdm(range(1, opt.background_iterations + 1), desc="Background warm-up")
+
+    def export_lossmaps(iteration):
+        if iteration in LOSSMAP_ITERATIONS:
+            save_background_lossmaps(
+                scene.model_path, iteration, train_cameras,
+                lambda camera: render(camera, bgaussians, pipe, background,
+                                      use_trained_exp=False,
+                                      separate_sh=SPARSE_ADAM_AVAILABLE)["render"])
 
     for iteration in progress_bar:
         if network_gui.conn is None:
@@ -79,20 +101,29 @@ def train_bgaussians(scene, dataset, opt, pipe, background):
         render_pkg = render(viewpoint_cam, bgaussians, pipe, background, use_trained_exp=False, separate_sh=SPARSE_ADAM_AVAILABLE)
         rendered_image = render_pkg["render"]
         gt_image = viewpoint_cam.original_image.cuda()
+        alpha_mask = viewpoint_cam.alpha_mask.cuda()
 
-        Ll1 = l1_loss(rendered_image, gt_image)
-        if FUSED_SSIM_AVAILABLE:
-            ssim_value = fused_ssim(rendered_image.unsqueeze(0), gt_image.unsqueeze(0))
-        else:
-            ssim_value = ssim(rendered_image, gt_image)
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+        Ll1 = masked_l1_loss(rendered_image, gt_image, alpha_mask)
+        if Ll1 is None:
+            bgaussians.optimizer.zero_grad(set_to_none=True)
+            export_lossmaps(iteration)
+            continue
+        loss = Ll1
         loss.backward()
+
+        # for pruning
+        with torch.no_grad():
+            ever_received_gradient |= (bgaussians.get_gradient_activity_mask(epsilon=0.0))
 
         bgaussians.optimizer.step()
         bgaussians.optimizer.zero_grad(set_to_none=True)
+        export_lossmaps(iteration)
 
         if iteration % 10 == 0:
             progress_bar.set_postfix({"Loss": f"{loss.item():.7f}", "Points": bgaussians.get_xyz.shape[0]})
+
+    # for pruning
+    bgaussians.prune_untrained_gaussians(ever_received_gradient)    
 
     return bgaussians
         
@@ -105,11 +136,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
-    scene = Scene(dataset, gaussians)
+    scene = Scene(dataset, gaussians, load_background_cameras=True)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
     bgaussians = train_bgaussians(scene, dataset, opt, pipe, background)
+
+    scene.save_bgaussians(bgaussians)
+    scene.releaseBackgroundTrainCameras()
+    torch.cuda.empty_cache()
     # freeze after warm-up (temporal)
     for parameter in [
         bgaussians._xyz,

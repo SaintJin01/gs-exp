@@ -564,7 +564,7 @@ class BackgroundGaussianModel(GaussianModel):
         max_focal_length = max(focal_lengths)
 
         # get initial background depth without parallax
-        radius = max_focal_length * max_camera_dist.item() / 0.5
+        radius = max_focal_length * max_camera_dist.item() / 20.0
 
         # fibonacci sphere
         idx = torch.arange(num_bgaussians, dtype=torch.float, device="cuda")
@@ -572,7 +572,7 @@ class BackgroundGaussianModel(GaussianModel):
         y = 1.0 - 2.0 * (idx + 0.5) / num_bgaussians
         r = torch.sqrt(torch.clamp(1.0 - y * y, min=0.0))
         theta = golden * idx
-        directions = torch.nn.functional.normalize(torch.stack([torch.cos(theta) * r, y, torch.sin(theta) * r], dim=1), dim=1,)
+        directions = torch.nn.functional.normalize(torch.stack([torch.cos(theta) * r, y, torch.sin(theta) * r], dim=1), dim=1)
         
         # xyzw
         xyz = directions.contiguous().float().cuda()
@@ -594,8 +594,8 @@ class BackgroundGaussianModel(GaussianModel):
         features[:, :, 0] = sh_dc
 
         # set parameter
-        self._xyz = nn.Parameter(xyz.contiguous().requires_grad_(True))
-        self._w = nn.Parameter(w.requires_grad_(True))
+        self._xyz = nn.Parameter(xyz.contiguous().requires_grad_(False))
+        self._w = nn.Parameter(w.requires_grad_(False))
         self._scaling = nn.Parameter(scaling.requires_grad_(True))
         self._rotation = nn.Parameter(rotations.requires_grad_(True))
         self._opacity = nn.Parameter(opacity.requires_grad_(True))
@@ -646,3 +646,54 @@ class BackgroundGaussianModel(GaussianModel):
             elif parameter_group["name"] == "w":
                 parameter_group["lr"] = w_lr
         return {"xyz": xyz_lr, "w": w_lr,}
+
+    def get_gradient_activity_mask(self, epsilon=0.0):
+        num_points = self.get_xyz.shape[0]
+        active_mask = torch.zeros(num_points, dtype=torch.bool, device=self.get_xyz.device)
+        parameters = [self._xyz, self._w, self._features_dc, self._features_rest, self._opacity, self._scaling, self._rotation]
+
+        for parameter in parameters:
+            if parameter.grad is None:
+                continue
+            gradient = parameter.grad.detach().reshape(num_points, -1)
+
+            if not torch.isfinite(gradient).all():
+                raise RuntimeError("Non-finite gradient detected in BackgroundGaussianModel.")
+
+            parameter_active = (gradient.abs().amax(dim=1) > epsilon)
+            active_mask |= parameter_active
+        return active_mask
+
+    def prune_untrained_gaussians(self, trained_mask):
+        num_points = self.get_xyz.shape[0]
+
+        if trained_mask.dtype != torch.bool:
+            raise TypeError("trained_mask must be a boolean tensor.")
+        if trained_mask.shape != (num_points,):
+            raise ValueError("trained_mask shape mismatch: expected {}, got {}".format((num_points,), tuple(trained_mask.shape)))
+
+        num_kept = int(trained_mask.sum().item())
+        num_pruned = num_points - num_kept
+
+        if num_kept == 0:
+            raise RuntimeError("All background Gaussians were marked untrained. Refusing to prune the entire background.")
+        if num_pruned == 0:
+            print("Background pruning: no untrained Gaussians found.")
+            return
+        
+        optimizable_tensors = self._prune_optimizer(trained_mask)
+
+        self._xyz = optimizable_tensors["xyz"]
+        self._w = optimizable_tensors["w"]
+        self._features_dc = optimizable_tensors["f_dc"]
+        self._features_rest = optimizable_tensors["f_rest"]
+        self._opacity = optimizable_tensors["opacity"]
+        self._scaling = optimizable_tensors["scaling"]
+        self._rotation = optimizable_tensors["rotation"]
+
+        self.xyz_gradient_accum = (self.xyz_gradient_accum[trained_mask])
+        self.denom = self.denom[trained_mask]
+        self.max_radii2D = self.max_radii2D[trained_mask]
+
+        print("Background pruning: kept {} / {}, pruned {} ({:.2f}%).".format(num_kept, num_points,num_pruned, 100.0 * num_pruned / num_points))
+        torch.cuda.empty_cache()

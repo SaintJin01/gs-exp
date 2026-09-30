@@ -98,23 +98,23 @@ class OptimizationParams(ParamGroup):
         self.random_background = False
         self.optimizer_type = "default"
         # Background Gaussian
-        self.background_num_gaussians = 100_000
-        self.background_iterations = 10_000
+        self.background_num_gaussians = 2_000_000
+        self.background_iterations = 20_000
 
         self.background_position_lr_init = 0.0001
         self.background_position_lr_final = 0.000001
         self.background_position_lr_delay_mult = 1.0
-        self.background_position_lr_max_steps = 10_000
+        self.background_position_lr_max_steps = 20_000
 
-        self.background_w_lr_init = 0.001
-        self.background_w_lr_final = 0.00001
+        self.background_w_lr_init = 0.000
+        self.background_w_lr_final = 0.00000
         self.background_w_lr_delay_mult = 0.01
-        self.background_w_lr_max_steps = 10_000
+        self.background_w_lr_max_steps = 20_000
 
         self.background_feature_lr = 0.0025
         self.background_opacity_lr = 0.01
-        self.background_scaling_lr = 0.001
-        self.background_rotation_lr = 0.0001
+        self.background_scaling_lr = 0.000
+        self.background_rotation_lr = 0.0000
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
