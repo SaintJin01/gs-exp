@@ -100,6 +100,9 @@ class OptimizationParams(ParamGroup):
         # Background Gaussian
         self.background_num_gaussians = 2_000_000
         self.background_iterations = 20_000
+        self.background_outlier_mask_iteration = 10_000
+        self.background_outlier_loss_threshold = 0.20
+        self.background_reset_opacity = 0.01
 
         self.background_position_lr_init = 0.0001
         self.background_position_lr_final = 0.000001

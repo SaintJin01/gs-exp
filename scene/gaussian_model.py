@@ -647,6 +647,17 @@ class BackgroundGaussianModel(GaussianModel):
                 parameter_group["lr"] = w_lr
         return {"xyz": xyz_lr, "w": w_lr,}
 
+    def reset_opacity_uniform(self, value=0.01):
+        if not 0.0 < value < 1.0:
+            raise ValueError("Background reset opacity must be strictly between 0 and 1.")
+        with torch.no_grad():
+            opacities_new = self.inverse_opacity_activation(torch.full_like(self.get_opacity, value))
+        optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
+        self._opacity = optimizable_tensors["opacity"]
+        actual = float(self.get_opacity.detach().mean().item())
+        print("Background opacity reset uniformly to {:.6f}; Adam opacity moments cleared.".format(actual))
+        return actual
+
     def get_gradient_activity_mask(self, epsilon=0.0):
         num_points = self.get_xyz.shape[0]
         active_mask = torch.zeros(num_points, dtype=torch.bool, device=self.get_xyz.device)

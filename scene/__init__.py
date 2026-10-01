@@ -72,24 +72,6 @@ class Scene:
             random.shuffle(scene_info.train_cameras)  # Multi-res consistent random shuffling
             random.shuffle(scene_info.test_cameras)  # Multi-res consistent random shuffling
 
-        foreground_image_dir = os.path.join(args.source_path, "compensation", "images")
-        if not os.path.isdir(foreground_image_dir):
-            raise FileNotFoundError("Foreground compensation image directory not found: {}".format(foreground_image_dir))
-        foreground_train_camera_infos = []
-        for camera_info in scene_info.train_cameras:
-            image_stem = os.path.splitext(os.path.basename(camera_info.image_name))[0]
-            foreground_image_path = os.path.join(foreground_image_dir, image_stem + ".png")
-            if not os.path.isfile(foreground_image_path):
-                raise FileNotFoundError("Foreground compensation image not found for '{}': {}".format(camera_info.image_name, foreground_image_path))
-            foreground_train_camera_infos.append(camera_info._replace(image_path=foreground_image_path))
-        foreground_test_camera_infos = []
-        for camera_info in scene_info.test_cameras:
-            image_stem = os.path.splitext(os.path.basename(camera_info.image_name))[0]
-            foreground_image_path = os.path.join(foreground_image_dir, image_stem + ".png")
-            if not os.path.isfile(foreground_image_path):
-                raise FileNotFoundError("Test compensation image not found for '{}': {}".format(camera_info.image_name, foreground_image_path))
-            foreground_test_camera_infos.append(camera_info._replace(image_path=foreground_image_path))
-
         background_train_camera_infos = []
 
         if load_background_cameras:
@@ -107,12 +89,12 @@ class Scene:
 
         for resolution_scale in resolution_scales:
             print("Loading Training Cameras")
-            self.train_cameras[resolution_scale] = cameraList_from_camInfos(foreground_train_camera_infos, resolution_scale, args, scene_info.is_nerf_synthetic, False)
+            self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale, args, scene_info.is_nerf_synthetic, False)
             if load_background_cameras:
                 print("Loading Background Training Cameras")
                 self.background_train_cameras[resolution_scale] = cameraList_from_camInfos(background_train_camera_infos, resolution_scale, args, scene_info.is_nerf_synthetic, False)
             print("Loading Test Cameras")
-            self.test_cameras[resolution_scale] = cameraList_from_camInfos(foreground_test_camera_infos, resolution_scale, args, scene_info.is_nerf_synthetic, True)
+            self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args, scene_info.is_nerf_synthetic, True)
 
         if self.loaded_iter:
             self.gaussians.load_ply(os.path.join(self.model_path,
