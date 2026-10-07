@@ -23,6 +23,22 @@ class Scene:
 
     gaussians : GaussianModel
 
+    @staticmethod
+    def save_background_pth(path, model):
+        if model.optimizer is not None:
+            torch.save(model.capture(), path)
+            return
+        torch.save({
+            "format": "frozen_gaussian_model_v1",
+            "active_sh_degree": model.active_sh_degree,
+            "xyz": model._xyz.detach().cpu(),
+            "features_dc": model._features_dc.detach().cpu(),
+            "features_rest": model._features_rest.detach().cpu(),
+            "opacity": model._opacity.detach().cpu(),
+            "scaling": model._scaling.detach().cpu(),
+            "rotation": model._rotation.detach().cpu(),
+        }, path)
+
     def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0], load_background_cameras=False):
         """b
         :param path: Path to colmap scene main folder.
@@ -131,7 +147,7 @@ class Scene:
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
         self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
         if bgaussians is not None:
-            torch.save(bgaussians.capture(), os.path.join(point_cloud_path, "bgaussians.pth"))
+            self.save_background_pth(os.path.join(point_cloud_path, "bgaussians.pth"), bgaussians)
             bgaussians.save_ply(os.path.join(point_cloud_path, "bgaussians.ply"))
             self.save_combined_ply(os.path.join(point_cloud_path, "combined.ply"), bgaussians)
         exposure_dict = {
@@ -145,7 +161,7 @@ class Scene:
     def save_bgaussians(self, bgaussians):
         point_cloud_path = os.path.join(self.model_path, "point_cloud/bgaussians")
         os.makedirs(point_cloud_path, exist_ok=True)
-        torch.save(bgaussians.capture(), os.path.join(point_cloud_path, "bgaussians.pth"))
+        self.save_background_pth(os.path.join(point_cloud_path, "bgaussians.pth"), bgaussians)
         bgaussians.save_ply(os.path.join(point_cloud_path, "bgaussians.ply"))
 
     def getTrainCameras(self, scale=1.0):

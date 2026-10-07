@@ -99,24 +99,29 @@ class OptimizationParams(ParamGroup):
         self.optimizer_type = "default"
         # Background Gaussian
         self.background_num_gaussians = 2_000_000
-        self.background_iterations = 20_000
+        self.background_sky_iterations = 5_000
+        self.background_far_iterations = 30_000
+        self.background_near_iterations = 30_000
+        self.background_sky_radius_pixel = 1.0
+        self.background_far_radius_pixel = 5.0
+        self.background_near_radius_pixel = 333.0
         self.background_outlier_mask_iteration = 10_000
-        self.background_outlier_loss_threshold = 0.20
-        self.background_reset_opacity = 0.01
+        self.background_outlier_loss_threshold = 0.05
+        self.background_superpixel_loss_fraction = 0.2
 
         self.background_position_lr_init = 0.0001
         self.background_position_lr_final = 0.000001
         self.background_position_lr_delay_mult = 1.0
-        self.background_position_lr_max_steps = 20_000
+        self.background_position_lr_max_steps = 30_000
 
         self.background_w_lr_init = 0.000
         self.background_w_lr_final = 0.00000
         self.background_w_lr_delay_mult = 0.01
-        self.background_w_lr_max_steps = 20_000
+        self.background_w_lr_max_steps = 30_000
 
         self.background_feature_lr = 0.0025
         self.background_opacity_lr = 0.01
-        self.background_scaling_lr = 0.000
+        self.background_scaling_lr = 0.0001
         self.background_rotation_lr = 0.0000
         super().__init__(parser, "Optimization Parameters")
 

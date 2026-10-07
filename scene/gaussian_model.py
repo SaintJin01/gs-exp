@@ -548,7 +548,7 @@ class BackgroundGaussianModel(GaussianModel):
         return self.covariance_activation(self.get_scaling * self.get_w_inv.unsqueeze(1), scaling_modifier,
                                           self._rotation)
 
-    def initialize(self, cameras, num_bgaussians):
+    def initialize(self, cameras, num_bgaussians, radius_pixel=1.0):
         # background center
         camera_centers = torch.stack([camera.camera_center for camera in cameras], dim=0)
         self.background_center = torch.mean(camera_centers, dim=0).detach()
@@ -564,7 +564,7 @@ class BackgroundGaussianModel(GaussianModel):
         max_focal_length = max(focal_lengths)
 
         # get initial background depth without parallax
-        radius = max_focal_length * max_camera_dist.item() / 20.0
+        radius = max_focal_length * max_camera_dist.item() / radius_pixel
 
         # fibonacci sphere
         idx = torch.arange(num_bgaussians, dtype=torch.float, device="cuda")
@@ -594,7 +594,7 @@ class BackgroundGaussianModel(GaussianModel):
         features[:, :, 0] = sh_dc
 
         # set parameter
-        self._xyz = nn.Parameter(xyz.contiguous().requires_grad_(False))
+        self._xyz = nn.Parameter(xyz.contiguous().requires_grad_(True))
         self._w = nn.Parameter(w.requires_grad_(False))
         self._scaling = nn.Parameter(scaling.requires_grad_(True))
         self._rotation = nn.Parameter(rotations.requires_grad_(True))

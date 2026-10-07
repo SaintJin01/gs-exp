@@ -11,6 +11,8 @@
 
 import os
 import torch
+import numpy as np
+from PIL import Image
 from random import randint
 from utils.loss_utils import l1_loss, ssim
 from utils.background_lossmap import LOSSMAP_ITERATIONS, save_background_lossmaps
@@ -50,89 +52,136 @@ def masked_l1_loss(rendered_image, gt_image, alpha_mask, loss_mask=None):
     absolute_error = torch.abs(rendered_image - gt_image)
     return absolute_error[valid_mask_rgb].mean()
 
-def train_bgaussians(scene, dataset, opt, pipe, background):
-    bgaussians = BackgroundGaussianModel(dataset.sh_degree, opt.optimizer_type)
+def freeze_gaussians(model):
+    model.optimizer = None
+    for parameter in [model._xyz, model._features_dc, model._features_rest, model._opacity, model._scaling, model._rotation]:
+        parameter.requires_grad_(False)
+    if hasattr(model, "_w"):
+        model._w.requires_grad_(False)
+    return model
+
+def merge_background_layers(layers, sh_degree):
+    combined = GaussianModel(sh_degree)
+    combined._xyz = torch.nn.Parameter(torch.cat([layer.get_means3D.detach() for layer in layers], dim=0), requires_grad=False)
+    combined._features_dc = torch.nn.Parameter(torch.cat([layer._features_dc.detach() for layer in layers], dim=0), requires_grad=False)
+    combined._features_rest = torch.nn.Parameter(torch.cat([layer._features_rest.detach() for layer in layers], dim=0), requires_grad=False)
+    combined._opacity = torch.nn.Parameter(torch.cat([layer._opacity.detach() for layer in layers], dim=0), requires_grad=False)
+    combined._scaling = torch.nn.Parameter(torch.cat([torch.log(layer.get_render_scaling.detach()) for layer in layers], dim=0), requires_grad=False)
+    combined._rotation = torch.nn.Parameter(torch.cat([layer._rotation.detach() for layer in layers], dim=0), requires_grad=False)
+    combined.active_sh_degree = max(layer.active_sh_degree for layer in layers)
+    return combined
+
+def save_background_layer(scene, name, model):
+    path = os.path.join(scene.model_path, "point_cloud", "bgaussians", "layers")
+    os.makedirs(path, exist_ok=True)
+    model.save_ply(os.path.join(path, name + ".ply"))
+
+def set_background_loss_masks(cameras, mode, sky_dir=None):
+    for camera in cameras:
+        if mode == "full":
+            camera.background_loss_mask = torch.ones_like(camera.alpha_mask)
+        elif mode == "sky":
+            path = os.path.join(sky_dir, os.path.splitext(os.path.basename(camera.image_name))[0] + ".png")
+            if not os.path.isfile(path):
+                raise FileNotFoundError("Sky superpixel mask not found: {}".format(path))
+            mask = Image.open(path).convert("L").resize((camera.image_width, camera.image_height), Image.Resampling.NEAREST)
+            mask = torch.from_numpy((np.asarray(mask) > 127).astype(np.float32)).unsqueeze(0).to(camera.alpha_mask.device)
+            camera.background_loss_mask = mask.to(camera.alpha_mask.dtype)
+        else:
+            raise ValueError("Unknown background loss mask mode: {}".format(mode))
+
+def train_background_stage(scene, dataset, opt, pipe, background, name, iterations, radius_pixel, mask_mode, fixed_background=None, lossmap_iterations=()):
     train_cameras = scene.getBackgroundTrainCameras()
-    
-    bgaussians.initialize(train_cameras, opt.background_num_gaussians)
-    bgaussians.training_setup(opt)
-    for camera in train_cameras:
-        camera.background_loss_mask = torch.ones_like(camera.alpha_mask)
+    set_background_loss_masks(train_cameras, mask_mode, os.path.join(dataset.source_path, "slic", "sky"))
 
-    # for pruning
-    ever_received_gradient = torch.zeros(bgaussians.get_xyz.shape[0], dtype=torch.bool, device="cuda")
+    def initialize_layer():
+        model = BackgroundGaussianModel(dataset.sh_degree, opt.optimizer_type)
+        model.initialize(train_cameras, opt.background_num_gaussians, radius_pixel=radius_pixel)
+        model.training_setup(opt)
+        activity = torch.zeros(model.get_xyz.shape[0], dtype=torch.bool, device="cuda")
+        return model, activity
 
+    layer, ever_received_gradient = initialize_layer()
     viewpoint_stack = []
-    progress_bar = tqdm(range(1, opt.background_iterations + 1), desc="Background warm-up")
+    phase_start_iteration = 0
+    progress_bar = tqdm(range(1, iterations + 1), desc="Background {}".format(name))
+
+    def render_stage(camera):
+        return render(camera, layer, pipe, background, use_trained_exp=False, separate_sh=SPARSE_ADAM_AVAILABLE, bpc=fixed_background)["render"]
 
     def export_lossmaps(iteration):
-        if iteration in LOSSMAP_ITERATIONS:
-            update_masks = iteration == opt.background_outlier_mask_iteration
-            save_background_lossmaps(
-                scene.model_path, iteration, train_cameras,
-                lambda camera: render(camera, bgaussians, pipe, background,
-                                      use_trained_exp=False,
-                                      separate_sh=SPARSE_ADAM_AVAILABLE)["render"],
-                update_masks=update_masks, threshold=opt.background_outlier_loss_threshold)
+        if iteration not in lossmap_iterations:
+            return
+        threshold_step = lossmap_iterations.index(iteration)
+        loss_threshold = opt.background_outlier_loss_threshold * (0.9 ** threshold_step)
+        print("[Background {} {}] Superpixel loss threshold: {:.6f}".format(name, iteration, loss_threshold))
+        save_background_lossmaps(
+            scene.model_path, iteration, train_cameras,
+            lambda camera: render(camera, layer, pipe, background, use_trained_exp=False, separate_sh=SPARSE_ADAM_AVAILABLE, bpc=fixed_background)["render"],
+            os.path.join(dataset.source_path, "slic", "labels"), os.path.join(dataset.source_path, "slic", "sky"), update_masks=True,
+            threshold=loss_threshold, superpixel_fraction=opt.background_superpixel_loss_fraction, stage_name=name)
 
     for iteration in progress_bar:
         if network_gui.conn is None:
             network_gui.try_connect()
         while network_gui.conn is not None:
             try:
-                (custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifier) = network_gui.receive()
+                custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifier = network_gui.receive()
                 net_image_bytes = None
                 if custom_cam is not None:
-                    net_image = render(custom_cam, bgaussians, pipe, background, scaling_modifier=scaling_modifier, use_trained_exp=False, separate_sh=SPARSE_ADAM_AVAILABLE)["render"]
+                    net_image = render(custom_cam, layer, pipe, background, scaling_modifier=scaling_modifier, use_trained_exp=False, separate_sh=SPARSE_ADAM_AVAILABLE, bpc=fixed_background)["render"]
                     net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
                 network_gui.send(net_image_bytes, dataset.source_path)
-                if do_training and (iteration < opt.background_iterations or not keep_alive):
+                if do_training and (iteration < iterations or not keep_alive):
                     break
             except Exception:
                 network_gui.conn = None
 
-        phase_iteration = iteration if iteration <= opt.background_outlier_mask_iteration else iteration - opt.background_outlier_mask_iteration
-        bgaussians.update_learning_rate(phase_iteration)
-
+        layer.update_learning_rate(iteration - phase_start_iteration)
         if iteration % 1000 == 0:
-            bgaussians.oneupSHdegree()
-
+            layer.oneupSHdegree()
         if not viewpoint_stack:
             viewpoint_stack = train_cameras.copy()
-
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
-        render_pkg = render(viewpoint_cam, bgaussians, pipe, background, use_trained_exp=False, separate_sh=SPARSE_ADAM_AVAILABLE)
-        rendered_image = render_pkg["render"]
-        gt_image = viewpoint_cam.original_image.cuda()
-        alpha_mask = viewpoint_cam.alpha_mask.cuda(); loss_mask = viewpoint_cam.background_loss_mask.cuda()
+        rendered_image = render_stage(viewpoint_cam)
+        loss = masked_l1_loss(rendered_image, viewpoint_cam.original_image.cuda(), viewpoint_cam.alpha_mask.cuda(), viewpoint_cam.background_loss_mask.cuda())
+        if loss is not None:
+            loss.backward()
+            with torch.no_grad():
+                ever_received_gradient |= layer.get_gradient_activity_mask(epsilon=0.0)
+            layer.optimizer.step()
+            layer.optimizer.zero_grad(set_to_none=True)
+        else:
+            layer.optimizer.zero_grad(set_to_none=True)
 
-        Ll1 = masked_l1_loss(rendered_image, gt_image, alpha_mask, loss_mask)
-        if Ll1 is None:
-            bgaussians.optimizer.zero_grad(set_to_none=True)
-            export_lossmaps(iteration)
-            continue
-        loss = Ll1
-        loss.backward()
-
-        # for pruning
-        with torch.no_grad():
-            ever_received_gradient |= (bgaussians.get_gradient_activity_mask(epsilon=0.0))
-
-        bgaussians.optimizer.step()
-        bgaussians.optimizer.zero_grad(set_to_none=True)
         export_lossmaps(iteration)
-        if iteration == opt.background_outlier_mask_iteration:
-            bgaussians.reset_opacity_uniform(opt.background_reset_opacity)
-        if iteration == opt.background_outlier_mask_iteration:
+        if iteration in lossmap_iterations:
+            del layer
+            torch.cuda.empty_cache()
+            layer, ever_received_gradient = initialize_layer()
+            phase_start_iteration = iteration
             viewpoint_stack = []
+            print("[Background {} {}] Fully reinitialized current layer after mask update.".format(name, iteration))
+        if iteration % 10 == 0 and loss is not None:
+            progress_bar.set_postfix({"Loss": "{:.7f}".format(loss.item()), "Points": layer.get_xyz.shape[0]})
 
-        if iteration % 10 == 0:
-            progress_bar.set_postfix({"Loss": f"{loss.item():.7f}", "Points": bgaussians.get_xyz.shape[0]})
+    layer.prune_untrained_gaussians(ever_received_gradient)
+    freeze_gaussians(layer)
+    save_background_layer(scene, name, layer)
+    torch.cuda.empty_cache()
+    return layer
 
-    # for pruning
-    bgaussians.prune_untrained_gaussians(ever_received_gradient)    
-
-    return bgaussians
+def train_bgaussians(scene, dataset, opt, pipe, background):
+    near = train_background_stage(scene, dataset, opt, pipe, background, "stage_1_near", opt.background_near_iterations, opt.background_near_radius_pixel, "full", lossmap_iterations=LOSSMAP_ITERATIONS)
+    far = train_background_stage(scene, dataset, opt, pipe, background, "stage_2_far", opt.background_far_iterations, opt.background_far_radius_pixel, "full", fixed_background=near, lossmap_iterations=LOSSMAP_ITERATIONS)
+    fixed_near_far = merge_background_layers([near, far], dataset.sh_degree)
+    del near, far
+    torch.cuda.empty_cache()
+    sky = train_background_stage(scene, dataset, opt, pipe, background, "stage_3_sky", opt.background_sky_iterations, opt.background_sky_radius_pixel, "sky", fixed_background=fixed_near_far)
+    combined = merge_background_layers([fixed_near_far, sky], dataset.sh_degree)
+    del fixed_near_far, sky
+    torch.cuda.empty_cache()
+    return combined
         
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
@@ -152,17 +201,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     scene.save_bgaussians(bgaussians)
     scene.releaseBackgroundTrainCameras()
     torch.cuda.empty_cache()
-    # freeze after warm-up (temporal)
-    for parameter in [
-        bgaussians._xyz,
-        bgaussians._w,
-        bgaussians._features_dc,
-        bgaussians._features_rest,
-        bgaussians._opacity,
-        bgaussians._scaling,
-        bgaussians._rotation,
-    ]:
-        parameter.requires_grad_(False)
+    freeze_gaussians(bgaussians)
     torch.cuda.empty_cache()
 
     scene.initialize_sfm_gaussians()
