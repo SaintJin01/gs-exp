@@ -18,3 +18,4 @@ dependencies:
     - submodules/fused-ssim
     - opencv-python
     - joblib
+    - git+https://github.com/facebookresearch/segment-anything.git
