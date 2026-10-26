@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SAGA-style HDBSCAN prototypes and cosine assignment, with Rex hierarchy."""
+"""HDBSCAN on learned features and xyz, with optional noise retention."""
 
 import argparse
 import json
@@ -8,7 +8,9 @@ from pathlib import Path
 
 import hdbscan
 import numpy as np
+from plyfile import PlyData
 from scipy.cluster.hierarchy import fcluster, linkage
+from scipy.spatial import cKDTree
 
 
 FEATURE_HEADER = struct.Struct("<8sIIII")
@@ -54,67 +56,84 @@ def load_features(path):
     )
 
 
-def normalized_features(features, indices, gates=None):
-    """SAGA GUI: normalize exported features, multiply scale gate, normalize."""
+def normalized_features(features, indices):
+    """L2-normalize exported features directly, without PCA or channel gating."""
     points = np.asarray(features[indices], dtype=np.float32)
     if not np.isfinite(points).all():
         raise ValueError("Gaussian features contain non-finite values")
     points = points / np.maximum(np.linalg.norm(points, axis=1, keepdims=True), 1e-12)
-    if gates is not None:
-        points = points * gates[None, :]
-        points /= np.maximum(np.linalg.norm(points, axis=1, keepdims=True), 1e-12)
     return points
 
 
-def load_scale_gates(feature_path, dimension, count, args):
-    """Read the trained gate, never silently cluster without scale conditioning.
-
---scale is the SAGA GUI's normalized [0,1] value, not a physical 3D size.
-The training quantile transform must NOT be applied again at this point.
-"""
-    import torch
-    explicit = getattr(args, "scale_gate_file", None)
-    if explicit:
-        gate_path = Path(explicit).expanduser().resolve()
+def resolve_geometry_path(args, feature_path):
+    if args.ply_file:
+        source = Path(args.ply_file).expanduser().resolve()
+    elif args.model_path:
+        model = Path(args.model_path).expanduser().resolve()
+        iteration = args.iteration
+        config_path = feature_path.parent / "training_config.json"
+        if iteration is None and feature_path.parent.parent == model and config_path.is_file():
+            iteration = int(json.loads(config_path.read_text())["source_iteration"])
+        if iteration is None or iteration < 0:
+            candidates = []
+            for candidate in (model / "point_cloud").glob("iteration_*"):
+                suffix = candidate.name[len("iteration_"):]
+                if suffix.isdigit() and (candidate / "point_cloud.ply").is_file():
+                    candidates.append(int(suffix))
+            if not candidates:
+                raise FileNotFoundError("No point_cloud/iteration_*/point_cloud.ply in {}".format(model))
+            iteration = max(candidates)
+        source = model / "point_cloud" / ("iteration_{}".format(iteration)) / "point_cloud.ply"
     else:
-        checkpoint = feature_path.with_suffix(".pt")
-        gate_path = checkpoint if checkpoint.is_file() else feature_path.parent / "scale_gate.pt"
-    if not gate_path.is_file():
-        raise FileNotFoundError(
-            "Trained scale gate not found: {}. Use newly trained SAGA features, "
-            "or specify --scale_gate_file path/to/scale_gate.pt".format(gate_path))
-    payload = torch.load(str(gate_path), map_location="cpu")
-    if not isinstance(payload, dict):
-        raise ValueError("Expected scale gate state_dict or feature checkpoint: {}".format(gate_path))
-    training = payload.get("training", {})
-    if "features" in payload:
-        if "scale_gate" not in payload:
-            raise ValueError("Checkpoint has no trained scale gate; retrain with the SAGA trainer: {}".format(gate_path))
-        if tuple(payload["features"].shape) != (count, dimension):
-            raise ValueError("Scale gate checkpoint/gsfeat Gaussian count or dimension mismatch")
-    state = payload.get("scale_gate", payload)
-    gate = torch.nn.Sequential(torch.nn.Linear(1, dimension), torch.nn.Sigmoid())
-    gate.load_state_dict(state, strict=True)
-    gate.eval()
-    if not all(torch.isfinite(parameter).all() for parameter in gate.parameters()):
-        raise ValueError("Scale gate contains nonfinite parameters")
-    aware = int(training.get("scale_aware_dim", -1))
-    with torch.no_grad():
-        if 0 < aware < dimension:
-            level = int((1.0 - args.scale) * aware)
-            values = (torch.arange(dimension) < dimension - aware + level).float()
-        else:
-            values = gate(torch.tensor([[args.scale]], dtype=torch.float32))[0]
-    values = values.cpu().numpy().astype(np.float32)
-    return values, {
-        "scale_gate_applied": True,
-        "scale_gate_file": str(gate_path),
-        "scale": float(args.scale),
-        "scale_domain": "normalized_SAGA_GUI_0_to_1",
-        "scale_quantile_reapplied": False,
-        "scale_aware_dim": aware,
-        "scale_gate_values": values.tolist(),
-    }
+        raise ValueError("--feature_file requires --ply_file for matching Gaussian xyz and sizes")
+    if not source.is_file():
+        raise FileNotFoundError(source)
+    return source
+
+
+def load_geometry_features(path, count):
+    vertex = PlyData.read(str(path))["vertex"].data
+    required = ("x", "y", "z")
+    if len(vertex) != count:
+        raise ValueError("PLY/feature count mismatch: {} vs {}".format(len(vertex), count))
+    if not all(name in vertex.dtype.names for name in required):
+        raise ValueError("PLY requires x, y, z fields")
+    geometry = np.stack([vertex[name] for name in required], axis=1).astype(np.float32)
+    if not np.isfinite(geometry).all():
+        raise ValueError("Gaussian centers must be finite")
+    return geometry
+
+
+class JointFeatures:
+    """Lazy weighted blocks; never L2-normalize the concatenation afterward."""
+    def __init__(self, features, geometry, sample_indices, feature_weight=1.,
+                 xyz_weight=1.):
+        if geometry.shape != (len(features), 3):
+            raise ValueError("Geometry must contain matching xyz")
+        weights = np.asarray([feature_weight, xyz_weight], dtype=np.float64)
+        if not np.isfinite(weights).all() or (weights < 0).any() or not (weights > 0).any():
+            raise ValueError("Block weights must be finite, nonnegative, and not all zero")
+        fitted = geometry[sample_indices]
+        low, median, high = np.percentile(fitted, [25, 50, 75], axis=0)
+        spread = high - low
+        spread = np.where(spread > 1e-6, spread, 1.)
+        self.geometry = ((geometry - median) / spread).astype(np.float32)
+        self.geometry *= xyz_weight / np.sqrt(3.)
+        self.features, self.feature_weight = features, feature_weight
+        self.shape = (len(features), features.shape[1] + 3)
+        self.metadata = dict(
+            feature_weight=float(feature_weight), xyz_weight=float(xyz_weight),
+            geometry_normalizer="sample_median_IQR", size_features_applied=False,
+            geometry_median=median.tolist(), geometry_IQR_divisor=spread.tolist(),
+            geometry_axis_order=["x","y","z"],
+            geometry_block_divisor="sqrt(3)", concatenation_L2_normalized=False)
+
+    def __len__(self):
+        return self.shape[0]
+
+    def __getitem__(self, indices):
+        semantic = normalized_features(self.features, indices) * self.feature_weight
+        return np.concatenate((semantic, self.geometry[indices]), axis=1).astype(np.float32)
 
 
 def cluster_centers(points, labels, count):
@@ -135,6 +154,7 @@ def fit_density_clusters(sample, args):
         cluster_selection_epsilon=args.cluster_selection_epsilon,
         cluster_selection_method=args.cluster_selection_method,
         metric="euclidean",
+        prediction_data=True,
         allow_single_cluster=False,
         core_dist_n_jobs=args.jobs,
     )
@@ -151,35 +171,79 @@ def fit_density_clusters(sample, args):
             "HDBSCAN found no stable cluster. Reduce --min_cluster_size or "
             "--min_samples, or use --cluster_selection_method leaf."
         )
-    # The official SAGA GUI also averages sample noise (-1) into a prototype.
-    # Enumerate actual labels explicitly so the no-noise case remains valid.
-    prototype_source_labels, prototype_labels = np.unique(labels, return_inverse=True)
-    centers, sizes = cluster_centers(
-        sample, prototype_labels, len(prototype_source_labels)
-    )
-    centers = normalized_features(centers, slice(None))
-    return centers, sizes, {
+    # Noise is not a cluster prototype and is excluded from the hierarchy.
+    valid = labels >= 0
+    centers, sizes = cluster_centers(sample[valid], labels[valid], leaf_count)
+    return clusterer, centers, sizes, {
         "sample_stable_clusters": leaf_count,
         "sample_noise_count": noise_count,
         "sample_noise_ratio": noise_count / labels.size,
-        "prototype_source_labels": prototype_source_labels.tolist(),
     }
 
 
-def predict_cosine_labels(features, centers, batch_size, gates=None):
-    """Assign every Gaussian to its highest-cosine prototype, as in SAGA."""
-    labels = np.empty(features.shape[0], dtype=np.int32)
-    # Bound the temporary similarity matrix to about 64 MiB.
-    batch_size = min(batch_size, max(1, (16 * 1024 * 1024) // centers.shape[0]))
-    for start in range(0, features.shape[0], batch_size):
-        stop = min(start + batch_size, features.shape[0])
-        points = normalized_features(features, slice(start, stop), gates)
-        labels[start:stop] = np.argmax(points @ centers.T, axis=1).astype(np.int32)
+def prediction_label_map(clusterer, batch_size):
+    """Map prediction-tree labels to fitted labels, including epsilon merges.
+
+    Older hdbscan versions construct prediction trees without selection epsilon.
+    Calibrate on the fitted data rather than assuming the two label IDs match.
+    """
+    raw = clusterer.prediction_data_.raw_data
+    fitted = clusterer.labels_
+    maximum = max(clusterer.prediction_data_.cluster_map.values(), default=-1)
+    mapping = np.full(maximum + 1, -1, dtype=np.int32)
+    for start in range(0, len(raw), batch_size):
+        stop = min(start + batch_size, len(raw))
+        predicted, _ = hdbscan.approximate_predict(clusterer, raw[start:stop])
+        actual = fitted[start:stop]
+        valid = (predicted >= 0) & (actual >= 0)
+        for source, target in np.unique(np.stack((predicted[valid], actual[valid]), axis=1), axis=0):
+            if mapping[source] >= 0 and mapping[source] != target:
+                raise RuntimeError("Prediction-tree labels do not match fitted HDBSCAN clusters")
+            mapping[source] = target
+    return mapping
+
+
+def predict_density_labels(features, clusterer, sample_indices, batch_size):
+    """Keep exact fitted labels; predict unsampled points with rejection as noise."""
+    labels = np.full(features.shape[0], -1, dtype=np.int32)
+    fitted = np.zeros(features.shape[0], dtype=bool)
+    fitted[sample_indices] = True
+    if not fitted.all():
+        mapping = prediction_label_map(clusterer, batch_size)
+        for start in range(0, len(features), batch_size):
+            stop = min(start + batch_size, len(features))
+            indices = np.flatnonzero(~fitted[start:stop]) + start
+            if not len(indices):
+                continue
+            points = np.asarray(features[indices], dtype=np.float32)
+            predicted, _ = hdbscan.approximate_predict(clusterer, points)
+            valid = predicted >= 0
+            labels[indices[valid]] = mapping[predicted[valid]]
+    # Never re-predict the fitting sample: keep its original noise decisions.
+    labels[sample_indices] = clusterer.labels_.astype(np.int32, copy=False)
     noise_count = int(np.count_nonzero(labels < 0))
-    print("Cosine-assigned all Gaussians; unassigned {:,}/{:,} ({:.2%})".format(
-        noise_count, labels.size, noise_count / labels.size
-    ))
+    print("Density-assigned Gaussians; noise {:,}/{:,} ({:.2%})".format(
+        noise_count, labels.size, noise_count / labels.size))
     return labels
+
+
+def assign_noise_joint_space(features, labels, centers, batch_size):
+    """Nearest Euclidean centroid in the same weighted joint space as HDBSCAN."""
+    if not len(centers):
+        raise ValueError("Cannot assign noise without a stable cluster")
+    result = labels.copy()
+    tree = cKDTree(np.asarray(centers, dtype=np.float64))
+    reassigned = 0
+    for start in range(0, len(features), batch_size):
+        stop = min(start + batch_size, len(features))
+        indices = np.flatnonzero(result[start:stop] < 0) + start
+        if not len(indices):
+            continue
+        points = np.asarray(features[indices], dtype=np.float64)
+        result[indices] = tree.query(points, k=1)[1].astype(np.int32)
+        reassigned += len(indices)
+    print("Joint-space nearest-centroid assignment: {:,} noise assigned; remaining 0".format(reassigned))
+    return result
 
 
 def hierarchy_targets(leaf_count, requested_levels):
@@ -236,14 +300,17 @@ def write_clusters(path, leaf_labels, levels, leaf_count):
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="SAGA-style HDBSCAN and cosine prototype assignment with Rex hierarchy"
+        description="HDBSCAN on learned feature + xyz, with optional noise retention"
     )
     parser.add_argument("-m", "--model_path")
     parser.add_argument("--feature_file")
-    parser.add_argument("--scale", type=float, default=0.5,
-                        help="SAGA GUI normalized scale [0,1], default 0.5; no second quantile transform")
-    parser.add_argument("--scale_gate_file", type=str, default=None,
-                        help="trained scale_gate.pt or feature checkpoint; auto-detect beside gsfeat")
+    parser.add_argument("--ply_file", help="Matching PLY, same Gaussian ordering as gsfeat")
+    parser.add_argument("--iteration", type=int, default=None,
+                        help="Geometry iteration; default training source iteration, then latest")
+    parser.add_argument("--feature_weight", type=float, default=1.)
+    parser.add_argument("--xyz_weight", type=float, default=1.)
+    parser.add_argument("--keep_noise", action="store_true",
+                        help="Keep HDBSCAN -1 labels; default assigns noise to nearest joint-space centroid")
     parser.add_argument("-o", "--output")
     parser.add_argument("--sample_ratio", type=float, default=0.02,
                         help="per-Gaussian random fitting probability; SAGA default 2%%")
@@ -270,8 +337,6 @@ def main():
         raise FileNotFoundError(feature_path)
     if args.min_cluster_size < 2:
         raise ValueError("min cluster size must be >= 2")
-    if not np.isfinite(args.scale) or not 0.0 <= args.scale <= 1.0:
-        raise ValueError("--scale must be in [0,1] (SAGA normalized GUI scale)")
     if not 0.0 < args.sample_ratio <= 1.0:
         raise ValueError("sample ratio must be in (0, 1]")
     if args.sample_size is not None and args.sample_size < 0:
@@ -284,9 +349,8 @@ def main():
     features = load_features(feature_path)
     count, dimension = features.shape
     print("Loaded {:,} x {} features from {}".format(count, dimension, feature_path))
-    gates, gate_metadata = load_scale_gates(feature_path, dimension, count, args)
-    print("Scale gate: scale={:.3f}, weights {:.4f}..{:.4f}, loaded {}".format(
-        args.scale, float(gates.min()), float(gates.max()), gate_metadata["scale_gate_file"]))
+    gate_metadata = {"scale_gate_applied": False}
+    print("Scale gate disabled; using learned feature and xyz only")
     rng = np.random.RandomState(args.seed)
     if args.sample_size is None:
         sample_indices = np.flatnonzero(rng.rand(count) > 1.0 - args.sample_ratio)
@@ -299,14 +363,20 @@ def main():
     sample_count = sample_indices.size
     if sample_count < args.min_cluster_size:
         raise ValueError("Fitting sample is smaller than min_cluster_size")
-    print("HDBSCAN input: {}D scale-gated normalized features, no PCA; fitting {:,}/{:,} ({:.2%})".format(
-        dimension, sample_count, count, sample_count / count
-    ))
-    sample = normalized_features(features, sample_indices, gates)
-    leaf_centers, sample_leaf_sizes, sample_metadata = fit_density_clusters(sample, args)
-    leaf_labels = predict_cosine_labels(
-        features, leaf_centers, args.batch_size, gates,
-    )
+    ply_path = resolve_geometry_path(args, feature_path)
+    geometry = load_geometry_features(ply_path, count)
+    inputs = JointFeatures(features, geometry, sample_indices, args.feature_weight,
+                           args.xyz_weight)
+    print("HDBSCAN input: {}D = {}D learned feature + 3D xyz; no PCA; fitting {:,}/{:,} ({:.2%})".format(
+        inputs.shape[1], dimension, sample_count, count, sample_count / count))
+    print("Block weights: feature={}, xyz={}; PLY: {}".format(
+        args.feature_weight, args.xyz_weight, ply_path))
+    sample = inputs[sample_indices]
+    clusterer, leaf_centers, sample_leaf_sizes, sample_metadata = fit_density_clusters(sample, args)
+    leaf_labels = predict_density_labels(inputs, clusterer, sample_indices, args.batch_size)
+    density_noise_count = int(np.count_nonzero(leaf_labels < 0))
+    if not args.keep_noise:
+        leaf_labels = assign_noise_joint_space(inputs, leaf_labels, leaf_centers, args.batch_size)
     levels = build_hierarchy(leaf_centers, args.hierarchy_levels)
     write_clusters(output_path, leaf_labels, levels, leaf_centers.shape[0])
 
@@ -321,7 +391,10 @@ def main():
         "output_file": str(output_path),
         "num_gaussians": int(count),
         "feature_dimension": int(dimension),
-        "input_representation": "normalize(normalize(exported_smoothed_features)*scale_gate(scale))",
+        "input_representation": "weighted_L2_feature_and_robust_xyz",
+        "ply_file": str(ply_path),
+        "clustering_dimension": int(inputs.shape[1]),
+        "hierarchy_representation": "centroids_in_same_weighted_joint_space",
         "pca_applied": False,
         "sample_size": int(sample_count),
         "sample_ratio": sample_count / count,
@@ -329,8 +402,15 @@ def main():
         "min_cluster_size": int(args.min_cluster_size),
         "min_samples": int(args.min_samples if args.min_samples is not None else args.min_cluster_size),
         "allow_single_cluster": False,
-        "assignment": "maximum_cosine_to_normalized_sample_prototypes",
-        "sample_noise_prototype": True,
+        "assignment": ("hdbscan_approximate_predict_with_noise_rejection" if args.keep_noise else
+                       "hdbscan_then_noise_to_nearest_joint_space_centroid"),
+        "sample_labels_preserved": bool(args.keep_noise),
+        "sample_non_noise_labels_preserved": True,
+        "keep_noise": bool(args.keep_noise),
+        "noise_before_assignment": density_noise_count,
+        "noise_reassigned_count": 0 if args.keep_noise else density_noise_count,
+        "noise_label": -1,
+        "sample_noise_prototype": False,
         "cluster_selection_method": args.cluster_selection_method,
         "cluster_selection_epsilon": float(args.cluster_selection_epsilon),
         "leaf_clusters": int(leaf_centers.shape[0]),
@@ -341,6 +421,7 @@ def main():
         "sample_stable_cluster_sizes": sample_leaf_sizes.tolist(),
         "seed": int(args.seed),
     }
+    metadata.update(inputs.metadata)
     metadata.update(sample_metadata)
     metadata.update(gate_metadata)
     metadata_path = output_path.with_suffix(output_path.suffix + ".json")

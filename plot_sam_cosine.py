@@ -8,7 +8,7 @@ import torch
 import train_sam_features as training
 from cosine_history import CosineHistory
 from save_q3_gaussians_all_cameras import camera_from_json_record
-from saga_supervision import sample_supervision, contrastive_loss
+from saga_supervision import sample_single_supervision, contrastive_loss
 
 
 @torch.no_grad()
@@ -43,22 +43,20 @@ def main():
     pipe = SimpleNamespace(debug=False, antialiasing=config.get('antialiasing',False),
                            compute_cov3D_python=False, feature_backend='feature')
     packed, coverage, height, width = training.load_packed_masks(str(model/'sam_feature_data'/record['file']))
-    all_scales=[]
-    for r in manifest['cameras']:
-        with np.load(str(model/'sam_feature_data'/r['file'])) as data:
-            all_scales.append(data['mask_scales'])
+    if manifest.get('mask_format') != 'single_membership_packbits_v3':
+        raise ValueError('Regenerate single-membership SAM data first')
     torch.manual_seed(0)
     with np.load(str(model/'sam_feature_data'/record['file'])) as data:
-        supervision=sample_supervision(packed,coverage,data['mask_areas'],data['mask_scales'],
-            height,width,1000,float(np.concatenate(all_scales).max()),'cuda')
+        supervision=sample_single_supervision(packed,coverage,data['mask_areas'],
+                                              height,width,1000,'cuda')
     if supervision is None:
         raise ValueError('Not enough covered rays in this camera')
     output = folder/'cosine_eval'
     history=CosineHistory(output)
     for path in checkpoints:
         checkpoint=torch.load(str(path),map_location='cpu')
-        if checkpoint.get('training_format')!='saga_scale_conditioned_v2':
-            raise ValueError('Checkpoint lacks scale-conditioned training metadata: %s'%path)
+        if checkpoint.get('training_format')!='sam_single_mask_v3':
+            raise ValueError('Checkpoint is not single-mask training: %s'%path)
         features=checkpoint['features'].cuda()
         if len(features)!=len(cloud.get_xyz) or checkpoint['source_iteration']!=config['source_iteration']:
             raise ValueError('Checkpoint geometry mismatch')
@@ -67,15 +65,13 @@ def main():
             folder/('xyz_knn_iteration_%06d_k%d.npy'%(config['source_iteration'],k)),200000)
         smoothed=training.smooth_gaussian_features(features,neighbors,-1,65536)
         image=training.render_feature_map(camera,cloud,pipe,smoothed,config.get('white_background',False))
-        gate=torch.nn.Sequential(torch.nn.Linear(1,features.shape[1]),torch.nn.Sigmoid()).cuda()
-        gate.load_state_dict(checkpoint['scale_gate'])
-        _,stats=contrastive_loss(image,supervision,gate,checkpoint['quantile_transform'],
-            (height,width),scale_aware_dim=checkpoint['training'].get('scale_aware_dim',-1),collect_cosine=True)
+        _,stats=contrastive_loss(image,supervision,None,None,
+                                (height,width),collect_cosine=True)
         history.record(checkpoint['iteration'],record['camera_id'],stats['positive_cosine'],stats['negative_cosine'])
         print('%d: positive=%.5f negative=%.5f'%(checkpoint['iteration'],stats['positive_cosine'],stats['negative_cosine']),flush=True)
-        del features,smoothed,image,neighbors,gate,checkpoint
+        del features,smoothed,image,neighbors,checkpoint
     history.plot(alpha=1,title='Positive / negative cosine across training checkpoints',
-        note='Fixed training camera %d | same sampled rays and scales | all K neighbors | self-pairs excluded'%record['camera_id'])
+        note='Fixed training camera %d | same sampled rays | all K neighbors | self-pairs excluded'%record['camera_id'])
     print('Saved %s'%history.plot_path,flush=True)
 
 

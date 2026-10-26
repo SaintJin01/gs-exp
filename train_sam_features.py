@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train Gaussian affinity features with SAGA-style SAM correspondences."""
+"""Train 16D Gaussian features with single-membership SAM correspondences."""
 
 import json
 import math
@@ -14,8 +14,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from scipy.spatial import cKDTree
-from sklearn.preprocessing import QuantileTransformer
-from saga_supervision import sample_supervision, contrastive_loss
+from saga_supervision import sample_single_supervision, contrastive_loss
 from cosine_history import CosineHistory
 from tqdm import tqdm
 
@@ -52,12 +51,12 @@ def feature_rasterizer(camera, gaussians, pipeline, white_background=False):
 
 
 def render_feature_map(camera, gaussians, pipeline, gaussian_features, white_background=False):
-    """Render 32D once; the explicit RGB backend is a correctness reference."""
+    """Render 16D/32D once; the explicit RGB backend is a correctness reference."""
     normalized_features = gaussian_features / (gaussian_features.norm(dim=1, keepdim=True) + 1e-9)
     backend = getattr(pipeline, "feature_backend", "feature")
     if backend == "feature":
-        if normalized_features.shape[1] != 32:
-            raise ValueError("Feature backend requires 32D; use --feature_backend rgb for other dimensions")
+        if normalized_features.shape[1] not in (16, 32):
+            raise ValueError("Feature backend requires 16D or 32D; use --feature_backend rgb for other dimensions")
         from feature_blend import render_features
         settings = feature_rasterizer(camera, gaussians, pipeline, white_background).raster_settings
         return render_features(camera, gaussians, pipeline, normalized_features,
@@ -213,9 +212,8 @@ def save_checkpoint(path, features, iteration, args, gaussians, optimizer=None,
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "features": features.detach().cpu(),
-        "training_format": "saga_scale_conditioned_v2",
-        "scale_gate": gate.state_dict(),
-        "quantile_transform": quantile,
+        "training_format": "sam_single_mask_v3",
+        "scale_gate_enabled": False,
         "iteration": int(iteration),
         "feature_dim": int(features.shape[1]),
         "num_gaussians": int(features.shape[0]),
@@ -227,7 +225,7 @@ def save_checkpoint(path, features, iteration, args, gaussians, optimizer=None,
             "hard_positive_threshold": args.hard_positive_threshold,
             "hard_negative_threshold": args.hard_negative_threshold,
             "rfn": args.rfn,
-            "scale_aware_dim": args.scale_aware_dim,
+            "scale_gate_enabled": False,
             "smooth_k": args.smooth_k,
             "knn_dropout": args.knn_dropout,
         },
@@ -236,9 +234,6 @@ def save_checkpoint(path, features, iteration, args, gaussians, optimizer=None,
         payload["optimizer"] = optimizer.state_dict()
     torch.save(payload, str(path))
     if path.name == "latest.pt":
-        torch.save(gate.state_dict(), str(path.parent / "scale_gate.pt"))
-        np.savez(str(path.parent / "scale_transform.npz"),
-                 quantiles=quantile.quantiles_, references=quantile.references_)
         exported = features if export_features is None else export_features
         normalized = exported.detach().cpu().contiguous().numpy().astype(np.float32, copy=False)
         feature_path = path.with_suffix(".gsfeat")
@@ -256,7 +251,7 @@ def run(args, dataset, pipeline):
     pipeline.feature_backend = args.feature_backend
     if args.feature_backend == "feature":
         from feature_blend import load_extension
-        print("Preparing 32D feature CUDA renderer (first run compiles once)...", flush=True)
+        print("Preparing 16D/32D feature CUDA renderer (first run compiles once)...", flush=True)
         load_extension()
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -275,8 +270,8 @@ def run(args, dataset, pipeline):
             )
         )
     manifest = json.loads(manifest_path.read_text())
-    if manifest.get("mask_format") != "overlapping_packbits_scales_v2":
-        raise ValueError("Mask scales are required. Rerun prepare_sam_pairs.py before SAGA training.")
+    if manifest.get("mask_format") != "single_membership_packbits_v3":
+        raise ValueError("Single-membership masks are required. Rerun prepare_sam_pairs.py before training.")
 
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(
@@ -289,27 +284,18 @@ def run(args, dataset, pipeline):
         raise RuntimeError("No prepared cameras found in {}".format(manifest_path))
     if int(manifest["iteration"]) != args.source_iteration:
         raise ValueError("SAM mask scales were prepared from a different geometry iteration")
-    all_scales = []
-    for entry in entries:
-        with np.load(str(entry["label_path"]), allow_pickle=False) as data:
-            all_scales.append(data["mask_scales"])
-    all_scales = np.concatenate(all_scales)
-    if not len(all_scales) or not np.isfinite(all_scales).all():
-        raise ValueError("Prepared mask scales must be nonempty and finite")
-    upper_scale = float(all_scales.max())
-    quantile = QuantileTransformer(output_distribution="uniform")
-    quantile.fit(all_scales[:, None])
+    gate, quantile = None, None
 
     num_gaussians = int(gaussians.get_xyz.shape[0])
-    print("SAGA training: {:,} Gaussians, {}D, backend={}, K={}, keep={}, iterations={}, rays={}".format(
+    print("Single-mask training (no gate): {:,} Gaussians, {}D, backend={}, K={}, keep={}, iterations={}, rays={}".format(
         num_gaussians, args.feature_dim, args.feature_backend, args.smooth_k,
         max(1, int(args.smooth_k * args.knn_dropout)), args.iterations, args.num_sampled_rays))
     start_iteration = 0
     resume_path = getattr(args, "resume", None)
     if resume_path:
         checkpoint = torch.load(resume_path, map_location="cpu")
-        if checkpoint.get("training_format") != "saga_scale_conditioned_v2":
-            raise ValueError("Old feature checkpoints lack scale gates; start a fresh SAGA training run")
+        if checkpoint.get("training_format") != "sam_single_mask_v3":
+            raise ValueError("Checkpoint format differs; start a fresh 16D single-mask training run")
         loaded = checkpoint["features"]
         if loaded.shape != (num_gaussians, args.feature_dim):
             raise ValueError(
@@ -324,14 +310,7 @@ def run(args, dataset, pipeline):
             (num_gaussians, args.feature_dim), dtype=torch.float32, device="cuda"
         ) * 1e-2
     features = torch.nn.Parameter(initial)
-    gate = torch.nn.Sequential(torch.nn.Linear(1, args.feature_dim), torch.nn.Sigmoid()).cuda()
-    optimizer = torch.optim.Adam([
-        {"params": [features], "lr": args.learning_rate},
-        {"params": gate.parameters(), "lr": args.learning_rate},
-    ], lr=0.0, eps=1e-15)
-    if resume_path:
-        gate.load_state_dict(checkpoint["scale_gate"])
-        quantile = checkpoint["quantile_transform"]
+    optimizer = torch.optim.Adam([features], lr=args.learning_rate, eps=1e-15)
     if resume_path and args.save_optimizer and "optimizer" in checkpoint:
         optimizer.load_state_dict(checkpoint["optimizer"])
 
@@ -369,10 +348,9 @@ def run(args, dataset, pipeline):
         camera = entry["camera"]
         packed, coverage, height, width = load_packed_masks(str(entry["label_path"]))
         with np.load(str(entry["label_path"]), allow_pickle=False) as data:
-            sampled = sample_supervision(packed, coverage, data["mask_areas"],
-                                         data["mask_scales"], height, width,
-                                         args.num_sampled_rays, upper_scale,
-                                         features.device, args.ray_sample_rate)
+            sampled = sample_single_supervision(packed, coverage, data["mask_areas"],
+                                                height, width, args.num_sampled_rays,
+                                                features.device, args.ray_sample_rate)
         if sampled is None:
             continue
 
@@ -387,7 +365,7 @@ def run(args, dataset, pipeline):
         loss, stats = contrastive_loss(feature_map, sampled, gate, quantile,
                                        (height, width), args.rfn,
                                        args.hard_positive_threshold,
-                                       args.hard_negative_threshold, args.scale_aware_dim,
+                                       args.hard_negative_threshold, -1,
                                        collect_cosine=log_cosine)
         if not torch.isfinite(loss):
             raise RuntimeError("Nonfinite SAGA loss at camera {}".format(entry["camera_id"]))
@@ -428,6 +406,9 @@ def run(args, dataset, pipeline):
                 export_features=export_features,
                 gate=gate, quantile=quantile,
             )
+            del export_features
+        # Do not carry the previous render graph into the next native CUDA pass.
+        del feature_map, loss, smoothed_features, sampled
     cosine_history.plot()
     print("Cosine training chart: {}".format(cosine_history.plot_path))
     print("Saved trained Gaussian features to {}".format(output_dir / "latest.pt"))
@@ -436,17 +417,16 @@ def run(args, dataset, pipeline):
 
 def build_parser():
     parser = ArgumentParser(
-        description="Train alpha-blended Gaussian features with SAGA correspondences"
+        description="Train 16D alpha-blended Gaussian features without scale gates"
     )
     model = ModelParams(parser, sentinel=True)
     pipeline = PipelineParams(parser)
     parser.add_argument("--source_iteration", "--iteration", type=int, default=-1)
     parser.add_argument("--iterations", type=int, default=30000)
-    parser.add_argument("--feature_dim", type=int, default=32)
+    parser.add_argument("--feature_dim", type=int, default=16)
     parser.add_argument("--feature_backend", choices=("feature", "rgb"), default="feature",
                         help="feature: single geometry pass and feature-only backward; rgb: slow reference")
     parser.add_argument("--rfn", type=float, default=1.0)
-    parser.add_argument("--scale_aware_dim", type=int, default=-1)
     parser.add_argument("--ray_sample_rate", type=float, default=0.0)
     parser.add_argument(
         "--smooth_k", type=int, default=16,
@@ -498,8 +478,8 @@ if __name__ == "__main__":
         arg_parser.error("--model_path/-m is required")
     if parsed.feature_dim <= 0:
         arg_parser.error("--feature_dim must be positive")
-    if parsed.feature_backend == "feature" and parsed.feature_dim != 32:
-        arg_parser.error("--feature_backend feature requires --feature_dim 32")
+    if parsed.feature_backend == "feature" and parsed.feature_dim not in (16, 32):
+        arg_parser.error("--feature_backend feature requires --feature_dim 16 or 32")
     if parsed.smooth_k <= 0:
         arg_parser.error("--smooth_k must be positive")
     if not 0.0 < parsed.knn_dropout <= 1.0:

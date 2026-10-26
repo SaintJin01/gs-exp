@@ -15,7 +15,7 @@ from pathlib import Path
 import numpy as np
 from plyfile import PlyData
 from cluster_gaussians_twice import gaussian_geometry, ellipsoid_contacts, SphereIndex
-from cluster_gaussian_features import load_scale_gates, normalized_features
+from cluster_gaussian_features import normalized_features
 from fast_ellipsoid_overlap import ellipsoid_contacts_fast
 from threadpoolctl import threadpool_limits
 
@@ -141,10 +141,6 @@ def build_parser():
     parser.add_argument('--output', required=True)
     parser.add_argument('--overlap_gamma', '--gamma', dest='overlap_gamma', type=float, default=3.)
     parser.add_argument('--feature_threshold', type=float, default=.7)
-    parser.add_argument('--scale', type=float, default=.5,
-                        help='SAGA normalized segmentation scale in [0,1]')
-    parser.add_argument('--scale_gate_file', default=None,
-                        help='trained gate state_dict or checkpoint; auto-detect beside feature file')
     parser.add_argument('--min_cluster_size', type=int, default=20)
     parser.add_argument('--edge_batch_size', type=int, default=2048)
     parser.add_argument('--log_file', default=None)
@@ -156,8 +152,6 @@ def run(args):
         raise ValueError('overlap_gamma must be finite and positive')
     if not np.isfinite(args.feature_threshold) or not -1 <= args.feature_threshold <= 1:
         raise ValueError('feature_threshold must be in [-1,1]')
-    if not np.isfinite(args.scale) or not 0 <= args.scale <= 1:
-        raise ValueError('scale must be in [0,1] (SAGA normalized scale)')
     if args.min_cluster_size < 1 or args.edge_batch_size < 1:
         raise ValueError('min_cluster_size and edge_batch_size must be positive')
     started = time.time()
@@ -168,10 +162,9 @@ def run(args):
     features = load_features(Path(args.feature_file))
     if len(xyz) != len(features):
         raise ValueError('PLY/feature count mismatch: {} vs {}'.format(len(xyz), len(features)))
-    gates, gate_metadata = load_scale_gates(Path(args.feature_file).resolve(),
-                                            features.shape[1], len(features), args)
-    features = normalized_features(features, slice(None), gates)
-    print('Scale gate: scale={}, loaded {}'.format(args.scale, gate_metadata['scale_gate_file']), flush=True)
+    gate_metadata = {"scale_gate_applied": False}
+    features = normalized_features(features, slice(None))
+    print("Features: {}D normalized, no scale gate".format(features.shape[1]), flush=True)
     geometry = gaussian_geometry(vertex, args.overlap_gamma)
     print('Feature-overlap graph: gamma={}, cosine>={}, min_cluster_size={}; no fixed-k cap'.format(
         args.overlap_gamma, args.feature_threshold, args.min_cluster_size), flush=True)
@@ -182,7 +175,7 @@ def run(args):
         ply_file=str(Path(args.ply_file).resolve()), feature_file=str(Path(args.feature_file).resolve()),
         count=len(labels), cluster_count=count, noise_count=int((labels<0).sum()),
         noise_ratio=float((labels<0).mean()), overlap_gamma=args.overlap_gamma,
-        feature_threshold=args.feature_threshold, feature_metric='cosine_on_scale_gated_normalized_features',
+        feature_threshold=args.feature_threshold, feature_metric='cosine_on_normalized_features',
         min_cluster_size=args.min_cluster_size, fixed_k_candidate_cap=False,
         overlap_test='rotated_ellipsoid_contact_function', elapsed_seconds=time.time()-started)
     metadata.update(gate_metadata)

@@ -112,28 +112,17 @@ class OverlapGraphTests(unittest.TestCase):
             metadata=json.loads(Path(str(out)+'.json').read_text())
             self.assertEqual(metadata['overlap_gamma'],3)
             self.assertFalse(metadata['fixed_k_candidate_cap'])
-            self.assertTrue(metadata['scale_gate_applied'])
-            self.assertEqual(metadata['scale'],.5)
+            self.assertFalse(metadata['scale_gate_applied'])
+            self.assertNotIn('scale', metadata)
 
-    def test_scale_changes_feature_edges_without_changing_overlap(self):
-        from types import SimpleNamespace
-        from cluster_gaussian_features import load_scale_gates, normalized_features
-        gate=torch.nn.Sequential(torch.nn.Linear(1,2),torch.nn.Sigmoid())
-        with torch.no_grad():
-            gate[0].weight.copy_(torch.tensor([[10.],[-10.]]))
-            gate[0].bias.copy_(torch.tensor([-5.,5.]))
-        raw=np.array([[1,1],[1,-1]],dtype=np.float32)
+    def test_direct_normalized_features(self):
+        from cluster_gaussian_features import normalized_features
+        raw=np.array([[3,4],[3,-4]],dtype=np.float32)
+        features=normalized_features(raw,slice(None))
+        np.testing.assert_allclose(features, raw/5, atol=1e-7)
         vertex=vertices([[0,0,0],[1,0,0]])
-        with TemporaryDirectory() as temporary:
-            root=Path(temporary);torch.save(gate.state_dict(),str(root/'scale_gate.pt'))
-            counts=[]
-            for scale in (0.,1.):
-                gates,_=load_scale_gates(root/'features.gsfeat',2,2,
-                    SimpleNamespace(scale=scale,scale_gate_file=None))
-                features=normalized_features(raw,slice(None),gates)
-                _,count,_=calculate(vertex,features)
-                counts.append(count)
-            self.assertEqual(counts,[2,1])
+        _,count,_=calculate(vertex,features)
+        self.assertEqual(count,2)
 
 
 if __name__=='__main__':

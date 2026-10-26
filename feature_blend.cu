@@ -30,7 +30,7 @@ Buffers parse(torch::Tensor geom, torch::Tensor bins, torch::Tensor image, int n
     return {xy, conic, reinterpret_cast<uint32_t*>(bins.data_ptr()), last, ranges};
 }
 
-template<bool BACKWARD>
+template<int CHANNELS, bool BACKWARD>
 __global__ void blend(Buffers b, int width, int height, const float* features,
                       const float* grad_image, float* output, float background) {
     const int lane = threadIdx.y*16 + threadIdx.x;
@@ -43,11 +43,11 @@ __global__ void blend(Buffers b, int width, int height, const float* features,
     __shared__ float2 xy[256];
     __shared__ float4 conic[256];
     __shared__ uint32_t ids[256];
-    float value[32] = {0};
-    float gradients[32];
+    float value[CHANNELS] = {0};
+    float gradients[CHANNELS];
     if (BACKWARD && inside) {
         #pragma unroll
-        for (int c=0;c<32;c++) gradients[c] = grad_image[c*width*height+pixel];
+        for (int c=0;c<CHANNELS;c++) gradients[c] = grad_image[c*width*height+pixel];
     }
     float transmittance = 1;
     bool done = !inside || last==0;
@@ -70,9 +70,9 @@ __global__ void blend(Buffers b, int width, int height, const float* features,
             const float weight=alpha*transmittance;
             const int id=ids[j];
             #pragma unroll
-            for (int c=0;c<32;c++) {
-                if (BACKWARD) atomicAdd(output+id*32+c, weight*gradients[c]);
-                else value[c]+=features[id*32+c]*weight;
+            for (int c=0;c<CHANNELS;c++) {
+                if (BACKWARD) atomicAdd(output+id*CHANNELS+c, weight*gradients[c]);
+                else value[c]+=features[id*CHANNELS+c]*weight;
             }
             transmittance *= 1-alpha;
         }
@@ -80,7 +80,7 @@ __global__ void blend(Buffers b, int width, int height, const float* features,
     }
     if (!BACKWARD && inside) {
         #pragma unroll
-        for (int c=0;c<32;c++) output[c*width*height+pixel]=value[c]+background*transmittance;
+        for (int c=0;c<CHANNELS;c++) output[c*width*height+pixel]=value[c]+background*transmittance;
     }
 }
 
@@ -89,14 +89,20 @@ torch::Tensor blend_forward(torch::Tensor features, torch::Tensor geom,
                             int64_t rendered, int64_t height, int64_t width, double background) {
     TORCH_CHECK(features.is_cuda() && features.is_contiguous() && features.scalar_type()==torch::kFloat32,
                 "Expected contiguous CUDA float32 features");
-    TORCH_CHECK(features.dim()==2 && features.size(1)==32, "Feature backend requires 32 channels");
+    TORCH_CHECK(features.dim()==2 && (features.size(1)==16 || features.size(1)==32), "Feature backend requires 16 or 32 channels");
     c10::cuda::CUDAGuard guard(features.device());
-    auto output=torch::empty({32,height,width}, features.options());
+    auto output=torch::empty({features.size(1),height,width}, features.options());
     if (!features.size(0) || !rendered) return output.fill_(background);
     Buffers b=parse(geom,bins,image,features.size(0),height*width);
-    blend<false><<<dim3((width+15)/16,(height+15)/16),dim3(16,16),0,
+    if (features.size(1)==16) {
+    blend<16,false><<<dim3((width+15)/16,(height+15)/16),dim3(16,16),0,
                     at::cuda::getCurrentCUDAStream()>>>(b,width,height,features.data_ptr<float>(),nullptr,
                                                        output.data_ptr<float>(),background);
+    } else {
+    blend<32,false><<<dim3((width+15)/16,(height+15)/16),dim3(16,16),0,
+                    at::cuda::getCurrentCUDAStream()>>>(b,width,height,features.data_ptr<float>(),nullptr,
+                                                       output.data_ptr<float>(),background);
+    }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
 }
@@ -104,13 +110,19 @@ torch::Tensor blend_backward(torch::Tensor grad, torch::Tensor geom,
                              torch::Tensor bins, torch::Tensor image,
                              int64_t count, int64_t rendered) {
     c10::cuda::CUDAGuard guard(grad.device());
-    auto output=torch::zeros({count,32}, grad.options());
+    auto output=torch::zeros({count,grad.size(0)}, grad.options());
     if (!count || !rendered) return output;
     const int height=grad.size(1),width=grad.size(2);
     Buffers b=parse(geom,bins,image,count,height*width);
-    blend<true><<<dim3((width+15)/16,(height+15)/16),dim3(16,16),0,
+    if (grad.size(0)==16) {
+    blend<16,true><<<dim3((width+15)/16,(height+15)/16),dim3(16,16),0,
                    at::cuda::getCurrentCUDAStream()>>>(b,width,height,nullptr,grad.data_ptr<float>(),
                                                       output.data_ptr<float>(),0);
+    } else {
+    blend<32,true><<<dim3((width+15)/16,(height+15)/16),dim3(16,16),0,
+                   at::cuda::getCurrentCUDAStream()>>>(b,width,height,nullptr,grad.data_ptr<float>(),
+                                                      output.data_ptr<float>(),0);
+    }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
 }

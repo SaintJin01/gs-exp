@@ -96,7 +96,7 @@ def run(args, dataset, pipeline):
     )
     features = checkpoint["features"].to(device="cuda", dtype=torch.float32)
     pipeline.feature_backend = (args.feature_backend if args.feature_backend is not None
-                                else ("feature" if features.shape[1] == 32 else "rgb"))
+                                else ("feature" if features.shape[1] in (16, 32) else "rgb"))
     if features.shape[0] != gaussians.get_xyz.shape[0]:
         raise ValueError(
             "Feature/Gaussian count mismatch: {} versus {}".format(
@@ -125,18 +125,7 @@ def run(args, dataset, pipeline):
             camera, gaussians, pipeline, features, dataset.white_background
         )
         if args.scale is not None:
-            if "scale_gate" not in checkpoint:
-                raise ValueError("This checkpoint has no SAGA scale gate")
-            dimension = features.shape[1]
-            aware = int(checkpoint.get("training", {}).get("scale_aware_dim", -1))
-            if 0 < aware < dimension:
-                level = int((1 - args.scale) * aware)
-                gates = (torch.arange(dimension, device="cuda") < dimension - aware + level).float()
-            else:
-                gate = torch.nn.Sequential(torch.nn.Linear(1, dimension), torch.nn.Sigmoid()).cuda()
-                gate.load_state_dict(checkpoint["scale_gate"])
-                gates = gate(torch.tensor([[args.scale]], device="cuda"))[0]
-            feature_map = feature_map * gates[:, None, None]
+            print("--scale ignored: scale gate disabled")
     rendered_rgb = base.tensor_to_rgb_uint8(rendered)
 
     default_folder = "camera_{:05d}_{}".format(
@@ -178,7 +167,7 @@ def run(args, dataset, pipeline):
         "feature_checkpoint": str(checkpoint_path.resolve()),
         "feature_training_iteration": int(checkpoint.get("iteration", -1)),
         "feature_dim": int(features.shape[1]),
-        "normalized_scale": args.scale,
+        "scale_gate_applied": False,
         "camera_id": int(args.camera_id),
         "camera_split": split,
         "image_name": str(camera.image_name),
@@ -207,13 +196,13 @@ def build_parser():
     parser.add_argument("--source_iteration", "--iteration", type=int, default=-1)
     parser.add_argument("--feature_checkpoint", type=str, default=None)
     parser.add_argument("--feature_backend", choices=("feature", "rgb"), default=None,
-                        help="default: fast feature backend for 32D, RGB reference otherwise")
+                        help="default: fast feature backend for 16D/32D, RGB reference otherwise")
     parser.add_argument("--prompt_x", type=int, default=None)
     parser.add_argument("--prompt_y", type=int, default=None)
     parser.add_argument("--similarity_threshold", type=float, default=0.7)
     parser.add_argument("--pca_samples", type=int, default=100000)
     parser.add_argument("--scale", type=float, default=None,
-                        help="normalized SAGA scale in [0,1]; omit for unconditioned PCA")
+                        help="Deprecated; ignored (no scale gate)")
     parser.add_argument("--save_feature_map", action="store_true")
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--quiet", action="store_true")

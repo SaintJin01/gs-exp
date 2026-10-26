@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare overlapping SAM masks for SAGA-style Gaussian feature training."""
+"""Prepare coarse single-membership SAM masks and automatic previews."""
 
 import json
 import sys
@@ -23,7 +23,6 @@ from scene import Scene  # noqa: E402
 import save_q3_gaussians_all_cameras as q3  # noqa: E402
 from utils.general_utils import safe_state  # noqa: E402
 from train_sam_features import feature_rasterizer
-from saga_supervision import mask_scales_from_depth
 
 
 def retain_overlapping_masks(masks, height, width, min_segment_pixels):
@@ -64,9 +63,26 @@ def retain_overlapping_masks(masks, height, width, min_segment_pixels):
     return mask_stack, masks_packed, coverage_packed, records
 
 
+def retain_single_masks(masks, height, width, minimum):
+    """Largest mask wins: each covered pixel belongs to exactly one segment."""
+    occupied = np.zeros((height, width), dtype=bool)
+    annotations = []
+    for item in sorted(masks, key=lambda item: int(np.asarray(item["segmentation"]).sum()),
+                       reverse=True):
+        mask = np.asarray(item["segmentation"], dtype=bool)
+        if mask.shape != (height, width):
+            raise ValueError("SAM mask/image shape mismatch")
+        remaining = mask & ~occupied
+        if int(remaining.sum()) < minimum or int(remaining.sum()) == height * width:
+            continue
+        annotations.append(dict(item, segmentation=remaining))
+        occupied |= remaining
+    return retain_overlapping_masks(annotations, height, width, minimum)
+
+
 @torch.no_grad()
 def render_camera_depth(camera, gaussians, pipeline):
-    """SAGA depth is alpha-weighted center z, NOT this renderer's inverse depth."""
+    """Legacy depth diagnostic; not used by single-mask preparation/training."""
     xyz = gaussians.get_xyz.detach()
     homogeneous = torch.cat((xyz, torch.ones_like(xyz[:, :1])), dim=1)
     z = (homogeneous @ camera.world_view_transform)[:, 2]
@@ -108,7 +124,7 @@ def mask_preview(image, masks, output_path):
     fig, ax = plt.subplots(figsize=(max(8, image.shape[1] / 140),
                                     max(5, image.shape[0] / 140)))
     ax.imshow(np.clip(overlay, 0, 255).astype(np.uint8))
-    ax.set_title("Overlapping SAM masks used for SAGA-style training")
+    ax.set_title("Coarse single-membership SAM segments | {} segments".format(len(masks)))
     ax.axis("off")
     fig.tight_layout(pad=0.1)
     fig.savefig(str(output_path), dpi=150, bbox_inches="tight")
@@ -187,28 +203,16 @@ def run(args, dataset, pipeline):
         masks = generator.generate(sam_image)
         if args.max_segments > 0:
             masks = masks[:args.max_segments]
-        mask_stack, masks_packed, coverage_packed, segment_records = retain_overlapping_masks(
-            masks, image.shape[0], image.shape[1], args.min_segment_pixels
+        mask_stack, masks_packed, coverage_packed, segment_records = retain_single_masks(
+            masks, image.shape[0], image.shape[1],
+            max(args.min_segment_pixels, int(np.ceil(image.shape[0] * image.shape[1] * args.min_segment_fraction)))
         )
-        depth = render_camera_depth(camera, gaussians, pipeline)
-        reference_camera = scene.getTrainCameras()[0]
-        scales = mask_scales_from_depth(mask_stack, depth,
-                                        reference_camera.FoVx, reference_camera.FoVy)
-        valid = np.isfinite(scales) & (scales > 0)
-        if not valid.all():
-            print("  Dropping {} masks with degenerate 3D scale".format(int((~valid).sum())))
-            mask_stack, masks_packed = mask_stack[valid], masks_packed[valid]
-            segment_records = [r for r, keep in zip(segment_records, valid) if keep]
-            scales = scales[valid]
-            coverage_packed = (np.bitwise_or.reduce(masks_packed, axis=0) if len(scales)
-                               else np.zeros_like(coverage_packed))
         for mask_index, record_item in enumerate(segment_records):
             record_item["mask_index"] = mask_index
         file_name = "camera_{:05d}.npz".format(camera_id)
         np.savez_compressed(
             str(labels_dir / file_name),
-            format_version=np.asarray(2, dtype=np.int32),
-            mask_scales=scales,
+            format_version=np.asarray(3, dtype=np.int32),
             masks_packed=masks_packed,
             coverage_packed=coverage_packed,
             height=np.asarray(image.shape[0], dtype=np.int32),
@@ -225,7 +229,7 @@ def run(args, dataset, pipeline):
             )
             mask_preview(
                 image, mask_stack,
-                previews_dir / "camera_{:05d}_overlapping_masks.png".format(camera_id),
+                previews_dir / "camera_{:05d}_segments.png".format(camera_id),
             )
         covered_pixels = int(np.count_nonzero(mask_stack.any(axis=0))) if len(mask_stack) else 0
         manifest_records.append({
@@ -241,7 +245,7 @@ def run(args, dataset, pipeline):
             "masks": segment_records,
             "cameras_json_record": record,
         })
-        print("  {} SAM masks -> {} retained overlapping masks, {:,} covered pixels".format(
+        print("  {} SAM masks -> {} single-membership segments, {:,} covered pixels".format(
             len(masks), len(segment_records), covered_pixels
         ))
 
@@ -251,11 +255,13 @@ def run(args, dataset, pipeline):
         "model_path": str(Path(dataset.model_path).resolve()),
         "iteration": int(scene.loaded_iter),
         "split": args.split,
-        "mask_format": "overlapping_packbits_scales_v2",
-        "pair_definition": "SAGA scale-conditioned overlapping SAM correspondence",
+        "mask_format": "single_membership_packbits_v3",
+        "pair_definition": "Same segment positive; different segments negative; uncovered ignored",
         "image_source": args.image_source,
         "sam_color_order": args.sam_color_order,
         "min_segment_pixels": args.min_segment_pixels,
+        "min_segment_fraction": args.min_segment_fraction,
+        "overlap_resolution": "largest_mask_first",
         "sam": {
             "checkpoint": str(checkpoint),
             "model_type": sam_type,
@@ -274,7 +280,7 @@ def run(args, dataset, pipeline):
 
 def build_parser():
     parser = ArgumentParser(
-        description="Prepare overlapping SAM masks for SAGA-style affinity training"
+        description="Prepare coarse single-membership SAM masks and previews"
     )
     model = ModelParams(parser, sentinel=True)
     pipeline = PipelineParams(parser)
@@ -288,15 +294,18 @@ def build_parser():
     parser.add_argument("--sam_color_order", choices=("bgr", "rgb"), default="bgr",
                         help="BGR reproduces SAGA's cv2.imread extraction behavior")
     parser.add_argument("--sam_device", type=str, default="cuda")
-    parser.add_argument("--points_per_side", type=int, default=32)
+    parser.add_argument("--points_per_side", type=int, default=8)
     parser.add_argument("--points_per_batch", type=int, default=64)
     parser.add_argument("--pred_iou_thresh", type=float, default=0.88)
     parser.add_argument("--stability_score_thresh", type=float, default=0.95)
     parser.add_argument("--crop_n_layers", type=int, default=0)
-    parser.add_argument("--min_mask_area", type=int, default=100)
+    parser.add_argument("--min_mask_area", type=int, default=1000)
     parser.add_argument("--max_segments", type=int, default=0)
     parser.add_argument("--min_segment_pixels", type=int, default=1)
-    parser.add_argument("--save_previews", action="store_true")
+    parser.add_argument("--min_segment_fraction", type=float, default=0.01)
+    parser.add_argument("--save_previews", dest="save_previews", action="store_true")
+    parser.add_argument("--no_previews", dest="save_previews", action="store_false")
+    parser.set_defaults(save_previews=True)
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--quiet", action="store_true")
     return parser, model, pipeline
@@ -309,5 +318,7 @@ if __name__ == "__main__":
         arg_parser.error("--model_path/-m is required")
     if parsed.min_segment_pixels < 1:
         arg_parser.error("--min_segment_pixels must be positive")
+    if not 0 <= parsed.min_segment_fraction < 1:
+        arg_parser.error("--min_segment_fraction must be in [0,1)")
     safe_state(parsed.quiet)
     run(parsed, model_params.extract(parsed), pipeline_params.extract(parsed))

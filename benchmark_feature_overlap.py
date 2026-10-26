@@ -7,11 +7,10 @@ import json
 import pstats
 import time
 from pathlib import Path
-from types import SimpleNamespace
 import numpy as np
 from plyfile import PlyData
 import cluster_gaussians_feature_overlap as graph
-from cluster_gaussian_features import load_scale_gates,normalized_features
+from cluster_gaussian_features import normalized_features
 from cluster_gaussians_twice import gaussian_geometry
 
 
@@ -27,9 +26,7 @@ def main():
     vertex=vertex[:min(args.points,len(vertex))].copy()
     xyz=np.stack([vertex[k] for k in ('x','y','z')],axis=1).astype(np.float64)
     features=graph.load_features(Path(args.feature_file))
-    gates,_=load_scale_gates(Path(args.feature_file),features.shape[1],len(features),
-                             SimpleNamespace(scale=.5,scale_gate_file=None))
-    features=normalized_features(features,slice(0,len(vertex)),gates)
+    features=normalized_features(features,slice(0,len(vertex)))
     geometry=gaussian_geometry(vertex,3)
     spec=importlib.util.spec_from_file_location('overlap_reference',args.reference_script)
     reference=importlib.util.module_from_spec(spec);spec.loader.exec_module(reference)

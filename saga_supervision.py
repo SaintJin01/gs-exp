@@ -103,15 +103,18 @@ def contrastive_loss(feature_map, supervision, gate, quantile, mask_shape,
     norm_reg = (1 - feature_map.norm(dim=0).mean()).square()
     resized = F.interpolate(feature_map[None], mask_shape, mode="bilinear",
                             align_corners=False)[0]
-    normalized_scales = torch.as_tensor(quantile.transform(scales.detach().cpu().numpy()[:, None]),
-                                        device=feature_map.device, dtype=feature_map.dtype)
-    if 0 < scale_aware_dim < feature_map.shape[0]:
-        levels = ((1 - normalized_scales[:, 0]) * scale_aware_dim).long()
-        gates = (torch.arange(feature_map.shape[0], device=feature_map.device)[None] <
-                 (feature_map.shape[0] - scale_aware_dim + levels)[:, None]).float()
+    if gate is None:
+        vectors = resized.flatten(1).T[pixels][None]
     else:
-        gates = gate(normalized_scales)
-    vectors = resized.flatten(1).T[pixels][None] * gates[:, None]
+        normalized_scales = torch.as_tensor(quantile.transform(scales.detach().cpu().numpy()[:, None]),
+                                            device=feature_map.device, dtype=feature_map.dtype)
+        if 0 < scale_aware_dim < feature_map.shape[0]:
+            levels = ((1 - normalized_scales[:, 0]) * scale_aware_dim).long()
+            gates = (torch.arange(feature_map.shape[0], device=feature_map.device)[None] <
+                     (feature_map.shape[0] - scale_aware_dim + levels)[:, None]).float()
+        else:
+            gates = gate(normalized_scales)
+        vectors = resized.flatten(1).T[pixels][None] * gates[:, None]
     vectors = F.normalize(vectors, dim=-1)
     correlation = vectors @ vectors.transpose(1, 2)
     total = truth.sum(0)
@@ -134,3 +137,27 @@ def contrastive_loss(feature_map, supervision, gate, quantile, mask_shape,
     if collect_cosine:
         stats.update(cosine_statistics(correlation, truth))
     return pull + push + rfn * norm_reg, stats
+
+
+@torch.no_grad()
+def sample_single_supervision(packed, coverage, areas, height, width, num_rays,
+                              device, ray_sample_rate=0.0):
+    """Single segment per pixel, no scale-conditioned correspondence."""
+    n = height * width
+    probability = ray_sample_rate if ray_sample_rate > 0 else num_rays / n
+    covered = torch.as_tensor(np.unpackbits(coverage, count=n).astype(bool), device=device)
+    pixels = torch.where((torch.rand(n, device=device) < probability) & covered)[0]
+    if pixels.numel() < 2 or len(areas) == 0:
+        return None
+    ids = pixels.cpu().numpy()
+    members = ((packed[:, ids // 8] >> (7 - ids % 8)[None]) & 1).astype(bool)
+    if not (members.sum(axis=0) == 1).all():
+        raise ValueError("Expected one mask per covered pixel; regenerate SAM data")
+    labels = torch.as_tensor(members.argmax(axis=0), device=device)
+    truth = (labels[:, None] == labels[None, :]).float()[None]
+    pixel_areas = torch.as_tensor(areas, device=device, dtype=torch.float32)[labels]
+    product = pixel_areas[:, None] * pixel_areas[None, :]
+    weights = (product.max() / product.clamp_min(1e-9)).clamp_min(1)
+    span = weights.max() - weights.min()
+    weights = (weights - weights.min()) / span * 9 + 1 if span > 0 else torch.ones_like(weights)
+    return pixels, truth, weights, None

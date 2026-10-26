@@ -9,15 +9,16 @@ import torch
 from sklearn.preprocessing import QuantileTransformer
 import train_sam_features as training
 from save_q3_gaussians_all_cameras import camera_from_json_record
-from saga_supervision import sample_supervision, contrastive_loss
+from saga_supervision import sample_single_supervision, contrastive_loss
 
 
 def main():
     parser = ArgumentParser(__doc__)
     parser.add_argument('-m', '--model_path', required=True)
     parser.add_argument('--steps', type=int, default=3)
-    parser.add_argument('--backend', default='rgb', choices=('rgb', 'feature'))
+    parser.add_argument('--backend', default='feature', choices=('rgb', 'feature'))
     parser.add_argument('--camera_id', type=int, default=None)
+    parser.add_argument('--camera_sequence', type=int, nargs='+', default=None)
     parser.add_argument('--output', default=None)
     parser.add_argument('--verify', action='store_true', help='compare full-model feature/RGB outputs and gradients')
     args = parser.parse_args()
@@ -32,7 +33,7 @@ def main():
     original_width, original_height = camera_record['width'], camera_record['height']
     if original_width > 1600:
         factor = original_width / 1600
-        camera_record['width'], camera_record['height'] = round(original_width/factor), round(original_height/factor)
+        camera_record['width'], camera_record['height'] = int(original_width/factor), int(original_height/factor)
         camera_record['fx'] *= camera_record['width']/original_width
         camera_record['fy'] *= camera_record['height']/original_height
     camera = camera_from_json_record(camera_record)
@@ -43,18 +44,13 @@ def main():
     pipe = SimpleNamespace(compute_cov3D_python=False, debug=False, antialiasing=False,
                            feature_backend=args.backend)
     label = model / 'sam_feature_data' / record['file']
-    # Pre-fit with every view's scales, as in actual training.
-    all_scales = []
-    for item in manifest['cameras']:
-        with np.load(str(model / 'sam_feature_data' / item['file'])) as data:
-            all_scales.append(data['mask_scales'])
-    all_scales = np.concatenate(all_scales)
-    quantile = QuantileTransformer(output_distribution='uniform').fit(all_scales[:, None])
+    if manifest.get('mask_format') != 'single_membership_packbits_v3':
+        raise ValueError('Regenerate single-membership SAM data first')
+    gate, quantile = None, None
     neighbors = training.load_or_build_xyz_knn(cloud.get_xyz, 16,
         model/'sam_features'/('xyz_knn_iteration_%06d_k16.npy' % iteration), 200000)
-    features = torch.nn.Parameter(torch.randn(len(cloud.get_xyz), 32, device='cuda') * .01)
-    gate = torch.nn.Sequential(torch.nn.Linear(1, 32), torch.nn.Sigmoid()).cuda()
-    optimizer = torch.optim.Adam([features] + list(gate.parameters()), lr=.0025, eps=1e-15)
+    features = torch.nn.Parameter(torch.randn(len(cloud.get_xyz), 16, device='cuda') * .01)
+    optimizer = torch.optim.Adam([features], lr=.0025, eps=1e-15)
     parity = None
     if args.verify:
         smoothed = training.smooth_gaussian_features(features, neighbors, .5, 65536)
@@ -78,6 +74,16 @@ def main():
     print('Benchmark: %d Gaussians, %dx%d render, backend=%s' %
           (len(features), camera.image_width, camera.image_height, args.backend), flush=True)
     for step in range(args.steps + 1):
+        if args.camera_sequence:
+            camera_id = args.camera_sequence[step % len(args.camera_sequence)]
+            record = next(r for r in manifest['cameras'] if r['camera_id'] == camera_id)
+            camera_record = record['cameras_json_record'].copy()
+            ow, oh = camera_record['width'], camera_record['height']
+            factor = max(1., ow / 1600.)
+            camera_record.update(width=int(ow/factor), height=int(oh/factor),
+                                 fx=camera_record['fx']/factor, fy=camera_record['fy']/factor)
+            camera = camera_from_json_record(camera_record)
+            label = model / 'sam_feature_data' / record['file']
         row = {}
         def mark(name, started):
             torch.cuda.synchronize()
@@ -87,10 +93,9 @@ def main():
         started = time.perf_counter()
         packed, coverage, h, w = training.load_packed_masks(str(label))
         with np.load(str(label)) as data:
-            areas, scales = data['mask_areas'], data['mask_scales']
+            areas = data['mask_areas']
         started = mark('load_masks', started)
-        supervision = sample_supervision(packed, coverage, areas, scales, h, w, 1000,
-                                          float(all_scales.max()), 'cuda')
+        supervision = sample_single_supervision(packed, coverage, areas, h, w, 1000, 'cuda')
         started = mark('supervision', started)
         smoothed = training.smooth_gaussian_features(features, neighbors, .5, 65536)
         started = mark('knn_forward', started)

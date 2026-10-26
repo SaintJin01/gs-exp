@@ -1,4 +1,4 @@
-"""32D renderer: one host geometry/sort pass, feature-only CUDA backward.
+"""16D/32D renderer: one host geometry/sort pass, feature-only CUDA backward.
 
 The host renderer supplies its exact forward contributor cutoffs, so alpha
 thresholds and early-stop behavior remain unchanged. Geometry is frozen.
@@ -19,7 +19,7 @@ def load_extension():
         cpp.CUDA_HOME = sys.prefix
     root = Path(__file__).resolve().parent
     os.environ.setdefault('MAX_JOBS', '2')
-    return cpp.load(name='gs_sam_feature_blend_v1',
+    return cpp.load(name='gs_sam_feature_blend_v2',
                     sources=[str(root/'feature_blend.cpp'), str(root/'feature_blend.cu')],
                     extra_cflags=['-O3'], extra_cuda_cflags=['-O3'],
                     extra_ldflags=['-L' + str(Path(sys.prefix)/'lib')], verbose=False)
