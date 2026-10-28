@@ -29,6 +29,11 @@ class Scene:
         self.model_path = args.model_path
         self.loaded_iter = None
         self.gaussians = gaussians
+        if getattr(args, "hdr_camera", False) and args.train_test_exp:
+            raise ValueError("--hdr_camera and --train_test_exp are incompatible")
+        self.gaussians.configure_camera(
+            getattr(args, "hdr_camera", False), getattr(args, "camera_blocks", 2),
+            getattr(args, "camera_width", 32), getattr(args, "camera_token_grid", 16))
 
         if load_iteration:
             if load_iteration == -1:

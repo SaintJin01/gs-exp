@@ -20,6 +20,7 @@ from utils.general_utils import safe_state, get_expon_lr_func
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
+from utils.hdr_utils import dk_gradient_weights, scale_densification_gradient
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 try:
@@ -45,6 +46,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
 
+    if opt.camera_lr <= 0 or opt.gradient_scale_radius <= 0:
+        raise ValueError("camera_lr and gradient_scale_radius must be positive")
+    if not 0 <= opt.gradient_scale_anneal_start < opt.gradient_scale_anneal_end:
+        raise ValueError("Require 0 <= gradient_scale_anneal_start < gradient_scale_anneal_end")
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
@@ -113,7 +118,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         if viewpoint_cam.alpha_mask is not None:
             alpha_mask = viewpoint_cam.alpha_mask.cuda()
-            image *= alpha_mask
+            image = image * alpha_mask
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
@@ -164,6 +169,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration < opt.densify_until_iter:
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+                if gaussians.hdr_camera and not opt.disable_gradient_scaling:
+                    weights = dk_gradient_weights(
+                        gaussians.get_xyz, viewpoint_cam.world_view_transform,
+                        opt.gradient_scale_radius * scene.cameras_extent, iteration,
+                        opt.gradient_scale_anneal_start, opt.gradient_scale_anneal_end)
+                    scale_densification_gradient(viewspace_point_tensor, weights)
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
@@ -175,8 +186,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             # Optimizer step
             if iteration < opt.iterations:
-                gaussians.exposure_optimizer.step()
-                gaussians.exposure_optimizer.zero_grad(set_to_none = True)
+                if gaussians.camera_optimizer is not None:
+                    gaussians.camera_optimizer.step()
+                    gaussians.camera_optimizer.zero_grad(set_to_none=True)
+                if gaussians.exposure_optimizer is not None:
+                    gaussians.exposure_optimizer.step()
+                    gaussians.exposure_optimizer.zero_grad(set_to_none=True)
                 if use_sparse_adam:
                     visible = radii > 0
                     gaussians.optimizer.step(visible, radii.shape[0])
