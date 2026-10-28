@@ -1,23 +1,31 @@
-"""Shared HDR-to-RGB image transformer, with no per-view latent parameters."""
+"""Shared HDR-to-RGB image CNN, with no per-view latent parameters."""
 import torch
 from torch import nn
 import torch.nn.functional as F
 
 
-class CameraTransformer(nn.Module):
+class ResidualConvBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
+
+    def forward(self, x):
+        return x + self.conv2(F.gelu(self.conv1(x)))
+
+
+class CameraCNN(nn.Module):
     def __init__(self, blocks=2, width=32, token_grid=16):
         super().__init__()
-        if blocks < 1 or width < 4 or width % 4 or token_grid < 1:
-            raise ValueError("blocks/grid must be positive; width must be a positive multiple of 4")
+        if blocks < 1 or width < 1 or token_grid < 1:
+            raise ValueError("blocks, width and grid must be positive")
         self.config = dict(blocks=blocks, width=width, token_grid=token_grid)
         self.encoder = nn.Sequential(nn.Conv2d(3, width, 3, padding=1), nn.GELU())
         self.low_encoder = nn.Sequential(
             nn.Conv2d(width, width * 2, 3, stride=2, padding=1), nn.GELU())
         self.position = nn.Linear(2, width * 2)
         self.blocks = nn.ModuleList([
-            nn.TransformerEncoderLayer(d_model=width * 2, nhead=4,
-                dim_feedforward=width * 4, dropout=0.0, activation="gelu",
-                batch_first=True, norm_first=True) for _ in range(blocks)])
+            ResidualConvBlock(width * 2) for _ in range(blocks)])
         self.decoder = nn.Sequential(
             nn.Conv2d(width * 3, width, 3, padding=1), nn.GELU(),
             nn.Conv2d(width, 3, 3, padding=1))
@@ -38,10 +46,10 @@ class CameraTransformer(nn.Module):
             torch.linspace(-1, 1, gh, device=low.device, dtype=low.dtype),
             torch.linspace(-1, 1, gw, device=low.device, dtype=low.dtype), indexing="ij")
         pos = torch.stack((xx, yy), dim=-1).reshape(1, gh * gw, 2)
-        tokens = low.flatten(2).transpose(1, 2) + self.position(pos)
+        # Keep the same coordinate features, now on the 2D feature grid.
+        context = low + self.position(pos).transpose(1, 2).reshape(1, -1, gh, gw)
         for block in self.blocks:
-            tokens = block(tokens)
-        context = tokens.transpose(1, 2).reshape(low.shape[0], -1, gh, gw)
+            context = block(context)
         context = F.interpolate(context, size=local.shape[-2:], mode="bilinear", align_corners=False)
         # Direct RGB generation; high-resolution features preserve spatial detail.
         image = torch.sigmoid(self.decoder(torch.cat((local, context), dim=1)))

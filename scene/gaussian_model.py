@@ -19,7 +19,7 @@ from utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import RGB2SH
 from utils.hdr_utils import srgb_to_linear, radiance_to_sh_dc
-from scene.camera_transformer import CameraTransformer
+from scene.camera_cnn import CameraCNN
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
@@ -74,23 +74,25 @@ class GaussianModel:
     def configure_camera(self, enabled=False, blocks=2, width=32, token_grid=16):
         self.hdr_camera = enabled
         self.camera_config = dict(blocks=blocks, width=width, token_grid=token_grid) if enabled else None
-        self.camera_model = CameraTransformer(**self.camera_config).cuda() if enabled else None
+        self.camera_model = CameraCNN(**self.camera_config).cuda() if enabled else None
 
     def save_camera(self, ply_path):
         if self.hdr_camera:
-            torch.save(dict(version=1, radiance_activation="softplus_sh",
+            torch.save(dict(version=2, camera_type="cnn", radiance_activation="softplus_sh",
                             config=self.camera_config, state_dict=self.camera_model.state_dict()),
-                       os.path.join(os.path.dirname(ply_path), "camera_transformer.pth"))
+                       os.path.join(os.path.dirname(ply_path), "camera_cnn.pth"))
 
     def load_camera(self, ply_path):
-        path = os.path.join(os.path.dirname(ply_path), "camera_transformer.pth")
+        path = os.path.join(os.path.dirname(ply_path), "camera_cnn.pth")
         if os.path.exists(path):
             payload = torch.load(path, map_location="cuda")
-            if payload.get("version") != 1 or payload.get("radiance_activation") != "softplus_sh":
-                raise ValueError("Unsupported HDR camera file")
+            if payload.get("version") != 2 or payload.get("camera_type") != "cnn" or payload.get("radiance_activation") != "softplus_sh":
+                raise ValueError("Expected a CNN HDR camera file (version 2); Transformer weights are incompatible")
             self.configure_camera(True, **payload["config"])
             self.camera_model.load_state_dict(payload["state_dict"])
             self.camera_model.eval()
+        elif os.path.exists(os.path.join(os.path.dirname(ply_path), "camera_transformer.pth")):
+            raise ValueError("Transformer sidecar detected; this branch requires camera_cnn.pth")
         elif self.hdr_camera:
             raise FileNotFoundError("HDR rendering requires " + path)
 
@@ -111,15 +113,15 @@ class GaussianModel:
         )
         if not self.hdr_camera:
             return state
-        return dict(version=1, gaussians=state, camera_config=self.camera_config,
+        return dict(version=2, camera_type="cnn", gaussians=state, camera_config=self.camera_config,
                     camera=self.camera_model.state_dict(),
                     camera_optimizer=self.camera_optimizer.state_dict())
 
     def restore(self, model_args, training_args):
         camera_state = model_args if isinstance(model_args, dict) else None
         if camera_state is not None:
-            if camera_state.get("version") != 1 or not self.hdr_camera:
-                raise ValueError("Resume an HDR checkpoint with --hdr_camera")
+            if camera_state.get("version") != 2 or camera_state.get("camera_type") != "cnn" or not self.hdr_camera:
+                raise ValueError("Resume a CNN HDR checkpoint (version 2) with --hdr_camera; Transformer checkpoints are incompatible")
             if camera_state["camera_config"] != self.camera_config:
                 raise ValueError("Checkpoint camera architecture does not match CLI options")
             model_args = camera_state["gaussians"]

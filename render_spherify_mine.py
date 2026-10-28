@@ -102,7 +102,7 @@ def render_trackball(dataset, pipeline, args):
             print(f"{index}\t{view.image_name}")
         return
     if args.both and not gaussians.hdr_camera:
-        raise ValueError("--both requires an HDR model with camera_transformer.pth")
+        raise ValueError("--both requires an HDR model with camera_cnn.pth")
     if gaussians.camera_model is not None:
         gaussians.camera_model.eval()
     index, reference = select_keyframe(views, args.keyframe, args.keyframe_mode)
