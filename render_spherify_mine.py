@@ -5,7 +5,7 @@
 
 -k selects the zero-based index in the chosen, unshuffled camera split.
 Use --keyframe-mode name to select an exact image name instead.
---both saves rasterized radiance (clipped for display) and camera-network RGB.
+--both saves rasterized radiance (clipped for display) and GCISP exposure/CRF RGB.
 The camera follows a small circle on a sphere around a fixed focus point.
 --angle is the cone half-angle in degrees (0 reproduces the keyframe).
 """
@@ -102,7 +102,7 @@ def render_trackball(dataset, pipeline, args):
             print(f"{index}\t{view.image_name}")
         return
     if args.both and not gaussians.hdr_camera:
-        raise ValueError("--both requires an HDR model with camera_transformer.pth")
+        raise ValueError("--both requires an HDR model with camera_gcisp.pth")
     if gaussians.camera_model is not None:
         gaussians.camera_model.eval()
     index, reference = select_keyframe(views, args.keyframe, args.keyframe_mode)
@@ -167,6 +167,8 @@ def render_trackball(dataset, pipeline, args):
             raise RuntimeError(f"MP4 output is missing or empty: {video_path}")
     metadata = dict(backend=BACKEND, split=args.split, keyframe_index=index,
                     both=args.both, hdr_camera=gaussians.hdr_camera,
+                    camera_type="gcisp" if gaussians.hdr_camera else None,
+                    radiance_activation="clamp_sh_plus_half" if gaussians.hdr_camera else None,
                     before_display="clamp(radiance * radiance_exposure, 0, 1); no gamma or per-frame normalization",
                     radiance_exposure=args.radiance_exposure,
                     videos={name: path.name for name, path in video_paths.items()},
@@ -196,7 +198,7 @@ def main():
                         help="Focus distance in scene units; default: median in-frustum Gaussian depth")
     parser.add_argument("--output", help="Empty output directory")
     parser.add_argument("--both", action="store_true",
-                        help="Save separate pre-camera radiance and post-camera RGB PNGs/MP4s")
+                        help="Save separate pre-GCISP radiance and post-GCISP exposure/CRF RGB PNGs/MP4s")
     parser.add_argument("--radiance-exposure", type=float, default=1.0,
                         help="Fixed multiplier for before-camera display; clamp to [0,1], default 1")
     parser.add_argument("--quiet", action="store_true")

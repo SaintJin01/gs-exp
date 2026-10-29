@@ -16,7 +16,7 @@ from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 from utils.hdr_utils import sh_to_radiance
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False, training_frame=None):
     """
     Render the scene. 
     
@@ -121,7 +121,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
     radiance_image = rendered_image if pc.hdr_camera else None
-    rendered_image = pc.camera_model(radiance_image) if pc.hdr_camera else rendered_image.clamp(0, 1)
+    rendered_image = pc.camera_model(radiance_image, camera_id=getattr(viewpoint_camera, "colmap_id", None), frame_name=training_frame) if pc.hdr_camera else rendered_image.clamp(0, 1)
     out = {
         "render": rendered_image,
         "radiance": radiance_image,

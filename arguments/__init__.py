@@ -48,9 +48,7 @@ class ModelParams(ParamGroup):
     def __init__(self, parser, sentinel=False):
         self.sh_degree = 3
         self.hdr_camera = False
-        self.camera_blocks = 2
-        self.camera_width = 32
-        self.camera_token_grid = 16
+        self.controller_activation_ratio = 0.8
         self._source_path = ""
         self._model_path = ""
         self._images = "images"
@@ -78,7 +76,8 @@ class PipelineParams(ParamGroup):
 class OptimizationParams(ParamGroup):
     def __init__(self, parser):
         self.iterations = 30_000
-        self.camera_lr = 0.0001
+        self.isp_lr = 0.002
+        self.controller_lr = 0.001
         self.disable_gradient_scaling = False
         self.gradient_scale_radius = 1.0
         self.gradient_scale_anneal_start = 4000

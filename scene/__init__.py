@@ -31,9 +31,7 @@ class Scene:
         self.gaussians = gaussians
         if getattr(args, "hdr_camera", False) and args.train_test_exp:
             raise ValueError("--hdr_camera and --train_test_exp are incompatible")
-        self.gaussians.configure_camera(
-            getattr(args, "hdr_camera", False), getattr(args, "camera_blocks", 2),
-            getattr(args, "camera_width", 32), getattr(args, "camera_token_grid", 16))
+
 
         if load_iteration:
             if load_iteration == -1:
@@ -78,6 +76,11 @@ class Scene:
             self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale, args, scene_info.is_nerf_synthetic, False)
             print("Loading Test Cameras")
             self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args, scene_info.is_nerf_synthetic, True)
+
+        frame_names = sorted(c.image_name for c in scene_info.train_cameras)
+        camera_ids = [0] if scene_info.is_nerf_synthetic else sorted(set(c.uid for c in scene_info.train_cameras))
+        self.gaussians.configure_camera(getattr(args, "hdr_camera", False), frame_names=frame_names,
+            camera_ids=camera_ids, controller_activation_ratio=getattr(args, "controller_activation_ratio", 0.8))
 
         if self.loaded_iter:
             self.gaussians.load_ply(os.path.join(self.model_path,

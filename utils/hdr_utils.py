@@ -1,21 +1,10 @@
 """Positive unbounded radiance and Gaussian-DK densification weighting."""
 import torch
-import torch.nn.functional as F
-from utils.sh_utils import C0
-
-
-def srgb_to_linear(rgb):
-    return torch.where(rgb <= 0.04045, rgb / 12.92, ((rgb + 0.055) / 1.055).pow(2.4))
-
-
-def radiance_to_sh_dc(radiance):
-    # Stable inverse softplus. A small floor permits initialization from black.
-    x = radiance.clamp_min(1e-6)
-    return (x + torch.log(-torch.expm1(-x))) / C0
 
 
 def sh_to_radiance(sh):
-    return F.softplus(sh)
+    # Match PPISP's official 3DGRUT SH path: lower bound only, no HDR ceiling.
+    return (sh + 0.5).clamp_min(0.0)
 
 
 @torch.no_grad()

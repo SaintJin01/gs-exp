@@ -1,0 +1,2 @@
+Adapted from https://github.com/nv-tlabs/ppisp at a247368047651db2e03e6f97a36e4f5bebbe5c5f (Apache-2.0).
+scene/camera_gcisp.py adapts the exposure-only controller from ppisp/__init__.py and exposure/CRF formulas and endpoint gradients from ppisp/src/ppisp_math.cuh and tests/torch_reference.py. Vignetting, chromaticity homography, color head and their regularizers are removed. This implementation uses PyTorch autograd instead of the fused CUDA extension.
