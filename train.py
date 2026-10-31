@@ -16,6 +16,8 @@ from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
+from scene.environment_gaussian import (EnvironmentGaussianModel, validate_environment_options,
+    phase_at)
 from utils.general_utils import safe_state, get_expon_lr_func
 import uuid
 from tqdm import tqdm
@@ -51,13 +53,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     if not 0 <= opt.gradient_scale_anneal_start < opt.gradient_scale_anneal_end:
         raise ValueError("Require 0 <= gradient_scale_anneal_start < gradient_scale_anneal_end")
     first_iter = 0
+    environment = getattr(dataset, 'env_background', False)
+    if environment:
+        validate_environment_options(dataset, opt)
     tb_writer = prepare_output_and_logger(dataset)
-    gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
+    gaussians = (EnvironmentGaussianModel(dataset.sh_degree, opt.optimizer_type, opt)
+                 if environment else GaussianModel(dataset.sh_degree, opt.optimizer_type))
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
+
+    if environment and not checkpoint:
+        gaussians.add_sfm_points()
+    if environment:
+        import json
+        with open(os.path.join(scene.model_path, 'environment_options.json'), 'w') as handle:
+            json.dump(vars(opt), handle, indent=2)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -75,7 +88,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
+    previous_phase = None
     for iteration in range(first_iter, opt.iterations + 1):
+        phase, scene_iteration = phase_at(iteration, opt) if environment else ('joint', iteration)
+        if phase != previous_phase:
+            if environment:
+                print('\n[ITER {}] Stage: {}'.format(iteration, phase))
+            viewpoint_stack = []
+            viewpoint_indices = []
+            previous_phase = phase
         if network_gui.conn == None:
             network_gui.try_connect()
         while network_gui.conn != None:
@@ -95,9 +116,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         controller_stage = gaussians.set_camera_stage(iteration)
         gaussians.update_learning_rate(iteration)
-
         # Every 1000 its we increase the levels of SH up to a maximum degree
-        if not controller_stage and iteration % 1000 == 0:
+        if not controller_stage and scene_iteration % 1000 == 0:
             gaussians.oneupSHdegree()
 
         # Pick a random Camera
@@ -128,7 +148,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
         else:
             ssim_value = ssim(image, gt_image)
-
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
         if gaussians.hdr_camera:
@@ -136,19 +155,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # Depth regularization
         Ll1depth_pure = 0.0
-        if not controller_stage and depth_l1_weight(iteration) > 0 and viewpoint_cam.depth_reliable:
+        if not controller_stage and depth_l1_weight(scene_iteration) > 0 and viewpoint_cam.depth_reliable:
             invDepth = render_pkg["depth"]
             mono_invdepth = viewpoint_cam.invdepthmap.cuda()
             depth_mask = viewpoint_cam.depth_mask.cuda()
 
             Ll1depth_pure = torch.abs((invDepth  - mono_invdepth) * depth_mask).mean()
-            Ll1depth = depth_l1_weight(iteration) * Ll1depth_pure 
+            Ll1depth = depth_l1_weight(scene_iteration) * Ll1depth_pure
             loss += Ll1depth
             Ll1depth = Ll1depth.item()
         else:
             Ll1depth = 0
 
         loss.backward()
+        if environment and iteration <= opt.env_train_iterations:
+            gaussians.record_environment_gradients()
 
         iter_end.record()
 
@@ -164,23 +185,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Densification
-            if not controller_stage and iteration < opt.densify_until_iter:
+            if not controller_stage and scene_iteration < opt.densify_until_iter:
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 if gaussians.hdr_camera and not opt.disable_gradient_scaling:
                     weights = dk_gradient_weights(
                         gaussians.get_xyz, viewpoint_cam.world_view_transform,
-                        opt.gradient_scale_radius * scene.cameras_extent, iteration,
+                        opt.gradient_scale_radius * scene.cameras_extent, scene_iteration,
                         opt.gradient_scale_anneal_start, opt.gradient_scale_anneal_end)
                     scale_densification_gradient(viewspace_point_tensor, weights)
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
-                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                if scene_iteration > opt.densify_from_iter and scene_iteration % opt.densification_interval == 0:
+                    size_threshold = 20 if scene_iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
                 
-                if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
+                if scene_iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and scene_iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
+
+            # Rotation-only freeze through env_train_iterations, then freeze
+            # the whole environment prefix without freezing SfM.
+            if environment and not controller_stage:
+                gaussians.freeze_environment_parameters(iteration)
 
             # Optimizer step
             if iteration < opt.iterations or gaussians.hdr_camera:
@@ -196,8 +222,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     gaussians.optimizer.step(visible, radii.shape[0])
                     gaussians.optimizer.zero_grad(set_to_none = True)
                 elif not controller_stage:
-                    gaussians.optimizer.step()
+                    if environment:
+                        gaussians.step_joint_optimizer(iteration)
+                    else:
+                        gaussians.optimizer.step()
                     gaussians.optimizer.zero_grad(set_to_none = True)
+
+            if environment and iteration == opt.env_train_iterations:
+                gaussians.prune_untrained_environment()
 
             # Log and save
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)

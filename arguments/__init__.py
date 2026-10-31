@@ -48,6 +48,7 @@ class ModelParams(ParamGroup):
     def __init__(self, parser, sentinel=False):
         self.sh_degree = 3
         self.hdr_camera = False
+        self.env_background = False
         self.controller_activation_ratio = 0.8
         self._source_path = ""
         self._model_path = ""
@@ -76,6 +77,14 @@ class PipelineParams(ParamGroup):
 class OptimizationParams(ParamGroup):
     def __init__(self, parser):
         self.iterations = 30_000
+        self.env_train_iterations = 10000
+        self.env_scaled_iterations = 7000
+        self.env_joint_iterations = 20000
+        self.env_controller_iterations = 3000
+        self.env_points = 2000000
+        self.env_radius_pixel = 5.0  # nominal parallax in training-image pixels
+        self.env_min_gradient = 1e-8
+        self.env_min_gradient_hits = 1
         self.isp_lr = 0.002
         self.controller_lr = 0.001
         self.disable_gradient_scaling = False

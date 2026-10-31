@@ -129,6 +129,8 @@ class GaussianModel:
     def restore(self, model_args, training_args):
         camera_state = model_args if isinstance(model_args, dict) else None
         if camera_state is not None:
+            if 'environment' in camera_state and not hasattr(self, 'env_opt'):
+                raise ValueError('Environment checkpoints require --env_background')
             if camera_state.get("version") != 4 or camera_state.get("camera_type") != "gcisp" or camera_state.get("radiance_activation") != "clamp_sh_plus_half" or not self.hdr_camera:
                 raise ValueError("Resume a GCISP v4 checkpoint with --hdr_camera; old softplus and ViT/CNN checkpoints require retraining")
             if camera_state["camera_config"] != self.camera_config:

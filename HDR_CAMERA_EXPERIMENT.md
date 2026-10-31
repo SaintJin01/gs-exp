@@ -78,3 +78,57 @@ python -m unittest discover -s tests -p 'test_*.py' -v
 Eight tests cover CRF identity/exposure stops, nontrivial CRF formula and numerical gradcheck, finite endpoint gradients, phase gradient isolation, camera routing, sidecar roundtrip/legacy rejection, positive radiance and Gaussian-DK scaling.
 
 The reduced exposure+CRF was also compared with the pinned upstream PyTorch reference for outputs and gradients. The retained controller's exposure output was compared with the upstream controller using matching weights. A real GPU smoke run exercises densification, both training phases, checkpoint resume and before/after video rendering. Checkpoint comparisons verify Gaussian tensors and exposure/CRF remain exactly unchanged in stage 2 while controller weights change. These checks establish execution and numerical consistency, not improved floater suppression or reconstruction quality.
+
+
+## Joint environment + SfM pipeline
+
+Enable with `--env_background --hdr_camera`. Initialize 2,000,000 environment
+Gaussians and append SfM Gaussians before the first iteration. There is no
+background-only pretraining, delayed SfM initialization or background-mask loss.
+Training uses the full-image reconstruction loss from iteration 1. Preview masks
+and `background_masks` files are retained but are not loaded by this pipeline.
+
+The Fibonacci sphere is centered at the mean camera center. Its radius is
+`max_focal_pixels * max_camera_pair_distance / p`, with `--env_radius_pixel 5`.
+Focals use resized training images. This is a nominal far-field estimate, not a
+strict all-view disparity bound. No w parameter is used. Initial opacity is 0.2,
+and isotropic scale is `radius * max(sqrt(4*pi/N), 1e-6)` (overlap 1.0).
+
+| Global iteration | Training and fixed parameters |
+| --- | --- |
+| 1..7000 | Environment + SfM + exposure/CRF; DK scaling follows the original 1..7000 schedule |
+| 7001..10000 | Same joint training; no DK suppression; environment rotation stays fixed |
+| End of 10000 | Prune environment points with insufficient DC gradient; preserve every SfM point in this operation |
+| 10001..27000 | Entire environment frozen; SfM + exposure/CRF continue training |
+| 27001..30000 | All Gaussian and exposure/CRF parameters frozen; train controllers only |
+
+`--env_train_iterations 10000` controls the environment freeze/prune boundary.
+The training schedule is 7000 scaled + 20000 joint + 3000 controller iterations.
+The old `--env_warmup_iterations` option is removed. SH and XYZ LR clocks start at
+iteration 1 and are never restarted. Scene densification ends at iteration 15000.
+
+Environment clone/split, ordinary size/opacity pruning and opacity resets are
+excluded throughout. During its first 10000 updates, only rotation is fixed;
+position, scale, opacity and SH optimize. Afterwards every environment parameter
+is frozen by clearing its gradient and Adam moments. SfM parameter updates are
+unaffected by this row-wise freeze. DK weights affect scene densification only.
+
+Environment learning rates remain XYZ 1e-4 to 1e-6 over 30000 steps, scale 1e-4,
+opacity 0.01, DC SH 0.0025, higher SH 0.0025/20, rotation 0. The shared Adam
+optimizer computes elementwise moments with scene LRs, then corrects environment
+updates to the environment LR before clearing gradients. This avoids changing SfM
+learning rates and requires extra temporary copies of updated environment rows.
+
+Gradient pruning uses mean RGB DC gradient norm (`--env_min_gradient`, 1e-8) and
+above-threshold count (`--env_min_gradient_hits`, 1). New training checkpoints use
+environment schema v2 and reject earlier pretraining checkpoints. Rendering keeps
+standard PLY + GCISP v4 sidecars. Resume uses identical environment options.
+
+```bash
+python train.py -s /home/sj/work/gs-dataset/tandt/train \
+  -m output/train_env_joint_gcisp --hdr_camera --env_background --eval -r 4 \
+  --iterations 30000 --disable_viewer \
+  --test_iterations 7000 10000 27000 30000 \
+  --save_iterations 7000 10000 27000 30000 \
+  --checkpoint_iterations 7000 10000 27000 30000
+```
