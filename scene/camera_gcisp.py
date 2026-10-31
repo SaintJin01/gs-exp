@@ -102,7 +102,7 @@ class ExposureController(nn.Module):
 
 
 class GCISP(nn.Module):
-    def __init__(self, frame_names, camera_ids, controller_activation_ratio=0.8):
+    def __init__(self, frame_names, camera_ids, controller_activation_ratio=6.0 / 7.0):
         super().__init__()
         if not frame_names or not camera_ids or not 0 < controller_activation_ratio < 1:
             raise ValueError("GCISP needs training frames/cameras and 0 < activation ratio < 1")
@@ -122,7 +122,8 @@ class GCISP(nn.Module):
         self.active_camera = None
 
     def set_stage(self, iteration, total_iterations):
-        self.stage_active = iteration >= max(1, int(total_iterations*self.config['controller_activation_ratio']))
+        # Training iterations are one-based: complete joint updates before switching.
+        self.stage_active = iteration > max(1, int(total_iterations*self.config['controller_activation_ratio']))
         self.exposure_params.requires_grad_(not self.stage_active)
         self.crf_params.requires_grad_(not self.stage_active)
         return self.stage_active

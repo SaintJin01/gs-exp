@@ -48,7 +48,7 @@ class ModelParams(ParamGroup):
     def __init__(self, parser, sentinel=False):
         self.sh_degree = 3
         self.hdr_camera = False
-        self.controller_activation_ratio = 0.8
+        self.controller_activation_ratio = 6.0 / 7.0
         self._source_path = ""
         self._model_path = ""
         self._images = "images"
@@ -75,13 +75,9 @@ class PipelineParams(ParamGroup):
 
 class OptimizationParams(ParamGroup):
     def __init__(self, parser):
-        self.iterations = 30_000
+        self.iterations = 35_000
         self.isp_lr = 0.002
         self.controller_lr = 0.001
-        self.disable_gradient_scaling = False
-        self.gradient_scale_radius = 1.0
-        self.gradient_scale_anneal_start = 4000
-        self.gradient_scale_anneal_end = 7000
         self.position_lr_init = 0.00016
         self.position_lr_final = 0.0000016
         self.position_lr_delay_mult = 0.01
@@ -99,10 +95,10 @@ class OptimizationParams(ParamGroup):
         self.densification_interval = 100
         self.opacity_reset_interval = 3000
         self.densify_from_iter = 500
-        self.densify_until_iter = 15_000
+        self.densify_until_iter = 10_000
         self.densify_grad_threshold = 0.0002
-        self.depth_l1_weight_init = 1.0
-        self.depth_l1_weight_final = 0.01
+        self.depth_smooth_weight = 0.01
+        self.depth_range_weight = 0.001
         self.random_background = False
         self.optimizer_type = "default"
         super().__init__(parser, "Optimization Parameters")

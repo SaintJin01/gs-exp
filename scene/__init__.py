@@ -80,7 +80,7 @@ class Scene:
         frame_names = sorted(c.image_name for c in scene_info.train_cameras)
         camera_ids = [0] if scene_info.is_nerf_synthetic else sorted(set(c.uid for c in scene_info.train_cameras))
         self.gaussians.configure_camera(getattr(args, "hdr_camera", False), frame_names=frame_names,
-            camera_ids=camera_ids, controller_activation_ratio=getattr(args, "controller_activation_ratio", 0.8))
+            camera_ids=camera_ids, controller_activation_ratio=getattr(args, "controller_activation_ratio", 6.0 / 7.0))
 
         if self.loaded_iter:
             self.gaussians.load_ply(os.path.join(self.model_path,

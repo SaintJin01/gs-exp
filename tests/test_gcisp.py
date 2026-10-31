@@ -11,6 +11,14 @@ class GCISPTests(unittest.TestCase):
     def model(self):
         return GCISP(['a', 'b'], [7])
 
+    def test_default_controller_has_exactly_5000_steps(self):
+        m = self.model()
+        self.assertFalse(m.set_stage(30000, 35000))
+        self.assertTrue(m.set_stage(30001, 35000))
+        self.assertTrue(m.set_stage(35000, 35000))
+        boundary = int(35000 * m.config['controller_activation_ratio'])
+        self.assertEqual(35000 - boundary, 5000)
+
     def test_identity_and_exposure_stops(self):
         m = self.model()
         x = torch.linspace(0, 2, 60).reshape(3,4,5)
@@ -53,7 +61,7 @@ class GCISPTests(unittest.TestCase):
         self.assertIsNotNone(m.exposure_params.grad)
         self.assertIsNone(m.controllers[0].exposure_head.weight.grad)
         m.zero_grad(set_to_none=True);x.grad=None
-        self.assertTrue(m.set_stage(8,10))
+        self.assertTrue(m.set_stage(9,10))
         m(x,frame_name='a').sum().backward()
         self.assertIsNone(x.grad)
         self.assertIsNone(m.crf_params.grad)
@@ -68,7 +76,7 @@ class GCISPTests(unittest.TestCase):
         x=torch.full((3,1,2),.25)
         torch.testing.assert_close(m(x,camera_id=1),x)
         with self.assertRaisesRegex(ValueError,'Unknown'): m(x,camera_id=3)
-        m.train();m.set_stage(8,10)
+        m.train();m.set_stage(9,10)
         self.assertTrue(torch.isfinite(m(x,camera_id=2)).all())
 
     @unittest.skipUnless(torch.cuda.is_available(),'CUDA required')

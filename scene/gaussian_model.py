@@ -70,7 +70,7 @@ class GaussianModel:
         self.camera_optimizer = None
         self.camera_config = None
 
-    def configure_camera(self, enabled=False, frame_names=None, camera_ids=None, controller_activation_ratio=0.8):
+    def configure_camera(self, enabled=False, frame_names=None, camera_ids=None, controller_activation_ratio=6.0 / 7.0):
         self.hdr_camera = enabled
         self.camera_config = dict(frame_names=frame_names, camera_ids=camera_ids,
             controller_activation_ratio=controller_activation_ratio) if enabled else None
@@ -329,7 +329,7 @@ class GaussianModel:
         self.save_camera(path)
 
     def reset_opacity(self):
-        opacities_new = self.inverse_opacity_activation(torch.min(self.get_opacity, torch.ones_like(self.get_opacity)*0.01))
+        opacities_new = self.inverse_opacity_activation(torch.min(self.get_opacity, torch.ones_like(self.get_opacity)*0.05))
         optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
         self._opacity = optimizable_tensors["opacity"]
 
