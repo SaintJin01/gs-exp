@@ -20,7 +20,7 @@ from utils.general_utils import safe_state
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
-from utils.adgs_utils import adgs_phase, edge_aware_depth_loss, opacity_reset_due
+from utils.fsgs_depth import prepare_depth_priors, load_prior, fsgs_depth_loss
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 try:
@@ -48,10 +48,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     if opt.isp_lr <= 0 or opt.controller_lr <= 0:
         raise ValueError("isp_lr and controller_lr must be positive")
-    if opt.depth_smooth_weight < 0 or opt.depth_range_weight < 0:
-        raise ValueError("Depth loss weights must be nonnegative")
-    if opt.densification_interval != 100 or opt.opacity_reset_interval != 3000:
-        raise ValueError("AD-GS requires densification_interval=100 and opacity_reset_interval=3000")
+    if opt.depth_weight < 0:
+        raise ValueError("depth_weight must be nonnegative")
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
@@ -60,6 +58,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
+
+    # Only training cameras contribute priors. Skip model loading for controller resume.
+    joint_end = (int(opt.iterations * gaussians.camera_model.config["controller_activation_ratio"])
+                 if gaussians.hdr_camera else opt.iterations)
+    if opt.depth_weight > 0 and first_iter < joint_end:
+        prepare_depth_priors(scene.getTrainCameras(),
+                             os.path.join(dataset.model_path, "fsgs_depth_cache"))
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -95,11 +100,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         iter_start.record()
 
         controller_stage = gaussians.set_camera_stage(iteration)
-        phase, apply_depth, densify_threshold, prune_threshold = adgs_phase(iteration, controller_stage)
+        apply_depth = not controller_stage and opt.depth_weight > 0
+        phase = "controller" if controller_stage else "joint"
         gaussians.update_learning_rate(iteration)
 
-        # Increase SH degree every 5000 iterations: 0 -> 1 -> 2 -> 3.
-        if not controller_stage and iteration % 5000 == 0:
+        # Original 3DGS SH schedule (maximum degree is unchanged).
+        if not controller_stage and iteration % 1000 == 0:
             gaussians.oneupSHdegree()
 
         # Pick a random Camera
@@ -116,7 +122,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE, training_frame=viewpoint_cam.image_name, render_z_depth=apply_depth and opt.depth_smooth_weight > 0)
+        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE, training_frame=viewpoint_cam.image_name, render_z_depth=apply_depth)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
         if viewpoint_cam.alpha_mask is not None:
@@ -136,11 +142,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if gaussians.hdr_camera:
             loss = loss + gaussians.camera_model.regularization_loss()
 
-        # AD-GS supervision uses rendered z-depth and GT RGB, not estimated depth.
         Ll1depth = 0.0
-        if apply_depth and opt.depth_smooth_weight > 0:
-            depth_loss = edge_aware_depth_loss(render_pkg["z_depth"], gt_image,
-                                              opt.depth_smooth_weight, opt.depth_range_weight)
+        if apply_depth:
+            prior = load_prior(viewpoint_cam, render_pkg["z_depth"].device)
+            depth_loss = opt.depth_weight * fsgs_depth_loss(render_pkg["z_depth"], prior)
             loss = loss + depth_loss
             Ll1depth = depth_loss.detach().item()
 
@@ -166,8 +171,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-                    gaussians.densify_and_prune(densify_threshold, prune_threshold,
-                                               scene.cameras_extent, None, radii)
+                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005,
+                                               scene.cameras_extent, size_threshold, radii)
+
+                if iteration % opt.opacity_reset_interval == 0 or (
+                        dataset.white_background and iteration == opt.densify_from_iter):
+                    gaussians.reset_opacity()
 
             # Optimizer step
             if iteration < opt.iterations or gaussians.hdr_camera:
@@ -185,10 +195,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 elif not controller_stage:
                     gaussians.optimizer.step()
                     gaussians.optimizer.zero_grad(set_to_none = True)
-
-            # Upstream resets AFTER optimizer update; never reset frozen controllers.
-            if opacity_reset_due(iteration, controller_stage, opt.opacity_reset_interval):
-                gaussians.reset_opacity()
 
             # Log and save
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)

@@ -1,31 +1,8 @@
 import unittest
 import torch
-from utils.adgs_utils import adgs_phase, opacity_reset_due, edge_aware_depth_loss, rasterize_z_depth
+from utils.fsgs_depth import rasterize_z_depth
 
-class ADGSTests(unittest.TestCase):
-    def test_boundaries(self):
-        expected = {1500:"warmup",1501:"low",1599:"low",1600:"high",
-                    1699:"high",1700:"low",29999:"low",30000:"high"}
-        for i, phase in expected.items():
-            self.assertEqual(adgs_phase(i)[0], phase)
-        self.assertEqual(adgs_phase(30001, True), ("controller", False, None, None))
-        self.assertEqual(adgs_phase(1700)[2:], (0.0005, 0.1))
-        events = [i for i in range(1,35001) if i > 500 and i < 10000 and i % 100 == 0]
-        self.assertEqual(events[-1], 9900)
-        self.assertEqual([i for i in events if adgs_phase(i)[0]=="low"][0],1700)
-        self.assertEqual([i for i in range(1,10000) if opacity_reset_due(i)],
-                         [501,3501,6501,9501])
-        self.assertFalse(opacity_reset_due(30501, True))
-
-    def test_loss_and_gradient(self):
-        d=torch.tensor([[[1.,2.],[3.,4.]]],requires_grad=True)
-        rgb=torch.zeros(3,2,2)
-        loss=edge_aware_depth_loss(d,rgb)
-        torch.testing.assert_close(loss,torch.tensor(.01*(3.-.001*3.)))
-        self.assertTrue(torch.autograd.gradcheck(
-            lambda x:edge_aware_depth_loss(x,rgb.double()),(d.detach().double().requires_grad_(),)))
-        self.assertLess(edge_aware_depth_loss(d,torch.tensor([[[0.,1.],[0.,1.]]]).expand(3,-1,-1)).item(),loss.item())
-
+class ZDepthTests(unittest.TestCase):
     def test_two_pass_matches_joint_compositing_gradients(self):
         # Differentiable analytic rasterizer with geometry-dependent alpha.
         # Compare outputs and every input gradient against joint RGB/z blending.

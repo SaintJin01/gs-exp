@@ -1,0 +1,2 @@
+# DPT_Hybrid dependency compatible with the existing PyTorch environment.
+timm==0.6.12

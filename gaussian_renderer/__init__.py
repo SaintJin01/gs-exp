@@ -15,7 +15,7 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 from utils.hdr_utils import sh_to_radiance
-from utils.adgs_utils import rasterize_z_depth
+from utils.fsgs_depth import rasterize_z_depth
 
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False, training_frame=None, render_z_depth=False):
     """

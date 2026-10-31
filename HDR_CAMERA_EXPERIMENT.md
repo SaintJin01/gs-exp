@@ -33,31 +33,35 @@ Inference uses the controller after it has received updates. This readiness is s
 
 ISP optimizer defaults: Adam lr=0.002, eps=1e-15; 500-step warmup from 0.01x then exponential decay with factor 0.01 over 30,000 decay steps. Controller Adam lr=0.001 is fixed. Optimizer groups are disjoint. CLI options are `--isp_lr`, `--controller_lr` and `--controller_activation_ratio`.
 
-## AD-GS regularization
+## FSGS training-view depth loss
 
-DK gradient scaling and its options are removed. Warm-up ends at iteration 1500.
-Afterwards low is iteration % 200 >= 100; high is the other half.
-Warm-up/high/low use (densification gradient, opacity prune) thresholds
-(0.0005, 0.005), (0.0002, 0.005), (0.0005, 0.1), respectively.
-Densify/prune every 100 iterations after 500, strictly before densify_until_iter.
-The cutoff is 10000, matching the AD-GS run script (last event: 9900).
-Size-based pruning is disabled. Low-phase depth regularization continues through
-joint training even after densification stops. Reset opacity to at most 0.05
-after optimizer updates at 501 + 3000*k, only outside controller training.
+Uses frozen MiDaS DPT_Hybrid (official dpt_hybrid_384.pt weights), code pinned
+to 454597711a62eabcbf7d1e89f3fb9f569051ac9b. Install requirements-fsgs.txt.
+On first training startup torch.hub downloads model code/weights if absent.
+Exact FSGS preprocessing: resized training GT RGB [0,1], (rgb-0.5)/0.5,
+bicubic resize to 384x512, DPT, bicubic resize back, align_corners=False.
+No metric conversion or per-image normalization. Float32 priors are cached
+under output/fsgs_depth_cache keyed by actual image content, resolution and
+model/preprocessing metadata. The model is released before optimization.
 
-Low phases use GT RGB edge weights and alpha-composited camera z-depth:
-0.01 * (edge-aware smoothness - 0.001 * (max_depth - min_depth)).
-Weights are --depth_smooth_weight and --depth_range_weight. External estimated
-inverse-depth L1 supervision is replaced. The rasterizer submodule is unchanged;
-its existing inverse-depth output remains available.
+Objective: min(1-corr(z_depth, -prior), 1-corr(z_depth, 1/(prior+200))).
+Weight --depth_weight defaults to 0.05 throughout joint training; zero disables.
+Finite-pixel and degenerate-variance guards avoid undefined correlations.
+This ports training-view depth guidance only, NOT FSGS pseudo views/unpooling
+or its 10000-step training schedule. Existing 30000+5000 GCISP stages remain.
+Controller-only resumes do not load DPT or calculate depth supervision.
 
-Z-depth is a second rasterizer invocation with z repeated as precomputed RGB,
-zero background and identical geometry/settings. It bypasses ISP and clamping.
-Both invocations share the auxiliary means2D tensor, so their gradient vectors
-sum before densification statistics take the norm, matching a joint RGB/depth
-renderer mathematically. CUDA accumulation can still differ in floating-point
-roundoff; bitwise identity and real-GPU equivalence have not been established.
-No extra depth pass, regularization, pruning or opacity reset in controller stage.
+AD-GS smoothness/range losses, high/low alternation, strong pruning and reset
+schedule are removed. Standard 3DGS densification ends at 15000, threshold
+0.0002, opacity pruning <0.005; size pruning restored. Reset caps opacity
+at 0.01 every 3000 iterations during densification (white-background exception
+retained). SH starts at 0, increases every 1000 iterations up to 3.
+DK gradient scaling remains removed.
+
+The rasterizer submodule is unchanged. Z-depth uses the existing extra pass
+with z repeated as precomputed RGB, zero background, no ISP/clamp and shared
+means2D gradients. Existing inverse-depth output is not used by this loss.
+No extra depth pass, densification, reset or SH updates in controller stage.
 
 ## Run
 
@@ -88,7 +92,8 @@ Resume with `--start_checkpoint .../chkpnt30000.pth` and the original model/opti
 python -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
-Existing tests cover CRF identity/exposure stops, nontrivial CRF formula and numerical gradcheck, finite endpoint gradients, phase gradient isolation, camera routing, sidecar roundtrip/legacy rejection, positive radiance. AD-GS CPU tests additionally cover phase boundaries, reset timing, loss arithmetic and two-pass gradient equivalence.
+Existing tests cover CRF identity/exposure stops, nontrivial CRF formula and numerical gradcheck, finite endpoint gradients, phase gradient isolation, camera routing, sidecar roundtrip/legacy rejection, positive radiance. FSGS CPU tests cover upstream loss values/gradients, exact preprocessing,
+invalid/flat inputs, cache invalidation and two-pass gradient equivalence.
 
 The reduced exposure+CRF was also compared with the pinned upstream PyTorch reference for outputs and gradients. The retained controller's exposure output was compared with the upstream controller using matching weights. A real GPU smoke run exercises densification, both training phases, checkpoint resume and before/after video rendering. Checkpoint comparisons verify Gaussian tensors and exposure/CRF remain exactly unchanged in stage 2 while controller weights change. These checks establish execution and numerical consistency, not improved floater suppression or reconstruction quality.
 
