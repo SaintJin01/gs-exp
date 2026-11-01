@@ -118,8 +118,12 @@ class CameraSpline:
         return camera
 
 
-def render_interpolation(dataset, iteration, pipeline, frames_per_interval, separate_sh):
+def render_interpolation(
+    dataset, iteration, pipeline, frames_per_interval, video_fps, separate_sh
+):
     if frames_per_interval < 1:
+        raise ValueError("-fpi must be at least 1.")
+    if video_fps < 1:
         raise ValueError("-fps must be at least 1.")
 
     with torch.no_grad():
@@ -178,7 +182,7 @@ def render_interpolation(dataset, iteration, pipeline, frames_per_interval, sepa
                     writer = cv2.VideoWriter(
                         output_path,
                         cv2.VideoWriter_fourcc(*"mp4v"),
-                        frames_per_interval,
+                        video_fps,
                         (width, height),
                     )
                     if not writer.isOpened():
@@ -199,7 +203,11 @@ if __name__ == "__main__":
     pipeline = PipelineParams(parser)
     parser.add_argument(
         "-fps", type=int, default=30,
-        help="Interpolated frames per camera interval; also used as MP4 FPS",
+        help="MP4 playback frames per second",
+    )
+    parser.add_argument(
+        "-fpi", type=int, default=30,
+        help="Generated frames per camera interval",
     )
     parser.add_argument("--iteration", default=-1, type=int)
     parser.add_argument("--quiet", action="store_true")
@@ -208,6 +216,6 @@ if __name__ == "__main__":
     print(f"Rendering camera interpolation for {args.model_path}")
     safe_state(args.quiet)
     render_interpolation(
-        model.extract(args), args.iteration, pipeline.extract(args), args.fps,
-        SPARSE_ADAM_AVAILABLE,
+        model.extract(args), args.iteration, pipeline.extract(args), args.fpi,
+        args.fps, SPARSE_ADAM_AVAILABLE,
     )
