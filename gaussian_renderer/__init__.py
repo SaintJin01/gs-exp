@@ -14,8 +14,9 @@ import math
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
+from utils.adgs_utils import rasterize_z_depth
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False, render_z_depth=False):
     """
     Render the scene. 
     
@@ -70,6 +71,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
     # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
     shs = None
+    dc = None
     colors_precomp = None
     if override_color is None:
         if pipe.convert_SHs_python:
@@ -109,6 +111,19 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             rotations = rotations,
             cov3D_precomp = cov3D_precomp)
         
+    z_depth = None
+    if render_z_depth:
+        # Reuse geometry and screen-space means so both passes contribute gradients.
+        depth_rasterizer = GaussianRasterizer(
+            raster_settings=raster_settings._replace(bg=torch.zeros_like(bg_color)))
+        geometry = dict(means3D=means3D, means2D=means2D, shs=None,
+                        opacities=opacity, scales=scales, rotations=rotations,
+                        cov3D_precomp=cov3D_precomp)
+        if separate_sh:
+            geometry["dc"] = None
+        z_depth = rasterize_z_depth(depth_rasterizer,
+                                   viewpoint_camera.world_view_transform, geometry)
+
     # Apply exposure to rendered image (training only)
     ppisp_adapter = getattr(pc, "ppisp_adapter", None)
     if use_trained_exp and ppisp_adapter is not None:
@@ -129,7 +144,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         "viewspace_points": screenspace_points,
         "visibility_filter" : (radii > 0).nonzero(),
         "radii": radii,
-        "depth" : depth_image
+        "depth" : depth_image,
+        "z_depth": z_depth
         }
     
     return out

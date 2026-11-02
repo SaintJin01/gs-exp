@@ -45,8 +45,8 @@ def main():
         common = ["-s", data, "--eval", "--iterations", "10", "--disable_viewer",
                   "--test_iterations", "5", "10", "--save_iterations", "8", "10",
                   "--checkpoint_iterations", "5", "9", "--densify_until_iter", "7",
-                  "--densify_from_iter", "1", "--densification_interval", "2",
-                  "--opacity_reset_interval", "100", "--densify_grad_threshold", "100"]
+                  "--densify_from_iter", "500", "--densification_interval", "100",
+                  "--opacity_reset_interval", "3000"]
         run("train.py", "-m", model, *common)
         for iteration in [8, 10]:
             run("render.py", "-m", model, "--iteration", iteration)

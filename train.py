@@ -16,11 +16,11 @@ from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
-from utils.general_utils import safe_state, get_expon_lr_func
+from utils.general_utils import safe_state
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
-from utils.gradient_scaling import dk_gradient_weights, scale_densification_gradient
+from utils.adgs_utils import adgs_phase, edge_aware_depth_loss, opacity_reset_due
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from utils.ppisp_utils import PPISPAdapter
@@ -47,10 +47,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
 
-    if opt.gradient_scale_radius <= 0:
-        raise ValueError("gradient_scale_radius must be positive")
-    if not 0 <= opt.gradient_scale_anneal_start < opt.gradient_scale_anneal_end:
-        raise ValueError("Require 0 <= gradient_scale_anneal_start < gradient_scale_anneal_end")
+    if opt.depth_smooth_weight < 0 or opt.depth_range_weight < 0:
+        raise ValueError("AD-GS depth weights must be nonnegative")
+    if opt.densification_interval != 100 or opt.opacity_reset_interval != 3000:
+        raise ValueError("AD-GS requires densification_interval=100 and opacity_reset_interval=3000")
 
     if dataset.ppisp and dataset.train_test_exp:
         raise ValueError("--train_test_exp is unavailable because PPISP is always enabled.")
@@ -80,7 +80,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     iter_end = torch.cuda.Event(enable_timing = True)
 
     use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE 
-    depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
 
     viewpoint_stack = scene.getTrainCameras().copy()
     viewpoint_indices = list(range(len(viewpoint_stack)))
@@ -108,6 +107,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         iter_start.record()
 
         distilling = isp is not None and isp.distilling
+        phase, apply_depth, densify_threshold, prune_threshold = adgs_phase(iteration, distilling)
         if distilling:
             for group in gaussians.optimizer.param_groups:
                 for parameter in group["params"]:
@@ -134,7 +134,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
+        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE, render_z_depth=apply_depth and opt.depth_smooth_weight > 0)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
         if viewpoint_cam.alpha_mask is not None:
@@ -154,19 +154,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if isp is not None and not distilling:
             loss = loss + isp.module.get_regularization_loss()
 
-        # Depth regularization
-        Ll1depth_pure = 0.0
-        if not distilling and depth_l1_weight(iteration) > 0 and viewpoint_cam.depth_reliable:
-            invDepth = render_pkg["depth"]
-            mono_invdepth = viewpoint_cam.invdepthmap.cuda()
-            depth_mask = viewpoint_cam.depth_mask.cuda()
-
-            Ll1depth_pure = torch.abs((invDepth  - mono_invdepth) * depth_mask).mean()
-            Ll1depth = depth_l1_weight(iteration) * Ll1depth_pure 
-            loss += Ll1depth
-            Ll1depth = Ll1depth.item()
-        else:
-            Ll1depth = 0
+        # AD-GS regularizes rendered z-depth using GT image edges; no depth prior.
+        Ll1depth = 0.0
+        if apply_depth and opt.depth_smooth_weight > 0:
+            depth_loss = edge_aware_depth_loss(render_pkg["z_depth"], gt_image,
+                                              opt.depth_smooth_weight, opt.depth_range_weight)
+            loss = loss + depth_loss
+            Ll1depth = depth_loss.detach().item()
 
         loss.backward()
 
@@ -178,7 +172,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
 
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"})
+                progress_bar.set_postfix({"Phase": phase, "Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"})
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
@@ -190,20 +184,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if not distilling and iteration < opt.densify_until_iter:
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-                if not opt.disable_gradient_scaling:
-                    weights = dk_gradient_weights(
-                        gaussians.get_xyz, viewpoint_cam.world_view_transform,
-                        opt.gradient_scale_radius * scene.cameras_extent, iteration,
-                        opt.gradient_scale_anneal_start, opt.gradient_scale_anneal_end)
-                    scale_densification_gradient(viewspace_point_tensor, weights)
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
+                    size_threshold = None  # AD-GS disables size-based pruning
+                    gaussians.densify_and_prune(densify_threshold, prune_threshold, scene.cameras_extent, size_threshold, radii)
                 
-                if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
-                    gaussians.reset_opacity()
 
             # Optimizer step
             if not distilling and (iteration < opt.iterations or isp is not None):
@@ -219,6 +205,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             if isp is not None:
                 isp.step()
+
+            # Match the prior AD-GS implementation: reset AFTER optimizer updates,
+            # including after densification ends, but never during distillation.
+            if opacity_reset_due(iteration, distilling, opt.opacity_reset_interval):
+                gaussians.reset_opacity()
 
             if iteration in saving_iterations:
                 print("\n[ITER {}] Saving Gaussians".format(iteration))

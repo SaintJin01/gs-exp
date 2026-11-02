@@ -8,7 +8,7 @@ Pinned commit: a247368047651db2e03e6f97a36e4f5bebbe5c5f (1.3.0).
 Run in a WSL bash terminal, not PowerShell:
 
 ```bash
-cd /home/sj/work/PPIPS/gaussian-splatting
+cd /home/sj/work/gs-exp
 # If the host C++ compiler is missing:
 # sudo apt-get update && sudo apt-get install -y build-essential
 bash scripts/setup_ppisp_env.sh
@@ -29,7 +29,7 @@ Set DATA to a COLMAP scene root containing images/ and sparse/0/, or a Blender
 synthetic scene containing transforms_train.json and transforms_test.json:
 
 ```bash
-cd /home/sj/work/PPIPS/gaussian-splatting
+cd /home/sj/work/gs-exp
 conda activate 3dgs-ppisp
 read -r -p "Dataset absolute path: " DATA
 python train.py -s "$DATA" -m output/ppisp --eval \
@@ -64,10 +64,20 @@ serialized, so a resumed trajectory is not guaranteed bit-for-bit identical.
 - --train_test_exp is unavailable because PPISP is always enabled.
 - Raw rasterizer RGB reaches PPISP before any upper clamp; evaluation/output
   clamps to the display range.
-- Gaussian-DK gradient scaling is enabled by default for densification statistics only.
-  It does not alter render forward output or Gaussian/PPISP optimizer gradients. The
-  default radius is one scene extent; scaling is half-annealed at step 4000 and off
-  from step 7000. Use the gradient_scale_* options to tune the schedule.
+- AD-GS scheduling/depth regularization is ported from commit `091f454`.
+  Gradient scaling and its CLI options are removed. No monocular depth prior loss.
+  Warm-up: iterations 1..1500. Afterwards, `iteration % 200 >= 100` selects Low;
+  the other 100 iterations select High. Thresholds (gradient, opacity) are
+  warm-up=(0.0005,0.005), High=(0.0002,0.005), Low=(0.0005,0.1).
+  Densification/pruning runs every 100 steps after 500 and before 10000 (last 9900).
+  Size-based pruning is disabled. Low-phase depth regularization continues after
+  10000 until controller distillation: smooth_weight=0.01, range_weight=0.001.
+  It uses GT RGB edges and alpha-composited z-depth from a second rasterizer pass;
+  the rasterizer submodule is unchanged. Both passes share screen-space gradients.
+  Opacity resets to at most 0.05 after the optimizer at 501+3000*k until distillation.
+  SH still increments every 1000 steps; the older 5000-step SH experiment is not used.
+  This is the earlier single-model AD-GS adaptation, without two-model pseudo-view
+  consistency. Full official PPISP (including vignetting/color correction) remains.
 - The first 80% of steps jointly train Gaussians and ISP parameters. At scheduler
   step 24000 (for 30000 total), the following training step starts the controller
   phase. Gaussian updates, SH progression, densification, opacity reset and depth
@@ -101,3 +111,5 @@ controller phase, stable mappings, early/final snapshots, training and rendering
 resume before/after freezing, and a baseline run without PPISP.
 The full conda installation script has not been executed end-to-end.
 Real-dataset convergence and image quality require a full training run.
+
+CPU AD-GS checks: `python -m unittest discover -s tests -v`. GPU training is not run by these checks.
