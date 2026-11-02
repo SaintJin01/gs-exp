@@ -77,24 +77,21 @@ class PipelineParams(ParamGroup):
 class OptimizationParams(ParamGroup):
     def __init__(self, parser):
         self.iterations = 30_000
-        self.env_train_iterations = 10000
-        self.env_scaled_iterations = 7000
-        self.env_joint_iterations = 20000
-        self.env_controller_iterations = 3000
+        self.env_train_iterations = 24000
+        self.env_prune_iteration = 10000
+        self.env_scaled_iterations = 0
+        self.env_joint_iterations = 24000
+        self.env_controller_iterations = 6000
         self.env_points = 2000000
         self.env_radius_pixel = 5.0  # nominal parallax in training-image pixels
         self.env_min_gradient = 1e-8
         self.env_min_gradient_hits = 1
         self.isp_lr = 0.002
         self.controller_lr = 0.001
-        self.disable_gradient_scaling = False
-        self.gradient_scale_radius = 1.0
-        self.gradient_scale_anneal_start = 4000
-        self.gradient_scale_anneal_end = 7000
         self.position_lr_init = 0.00016
         self.position_lr_final = 0.0000016
         self.position_lr_delay_mult = 0.01
-        self.position_lr_max_steps = 30_000
+        self.position_lr_max_steps = 24_000
         self.feature_lr = 0.0025
         self.opacity_lr = 0.025
         self.scaling_lr = 0.005
@@ -108,10 +105,10 @@ class OptimizationParams(ParamGroup):
         self.densification_interval = 100
         self.opacity_reset_interval = 3000
         self.densify_from_iter = 500
-        self.densify_until_iter = 15_000
+        self.densify_until_iter = 24_000
         self.densify_grad_threshold = 0.0002
-        self.depth_l1_weight_init = 1.0
-        self.depth_l1_weight_final = 0.01
+        self.depth_smooth_weight = 0.01
+        self.depth_range_weight = 0.001
         self.random_background = False
         self.optimizer_type = "default"
         super().__init__(parser, "Optimization Parameters")

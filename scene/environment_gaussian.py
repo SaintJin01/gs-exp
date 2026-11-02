@@ -18,16 +18,16 @@ def validate_environment_options(dataset, opt):
     if opt.optimizer_type != 'default':
         raise ValueError('Environment training requires --optimizer_type default')
     durations = [opt.env_scaled_iterations, opt.env_joint_iterations, opt.env_controller_iterations]
-    if any(n <= 0 for n in durations) or sum(durations) != opt.iterations:
-        raise ValueError('--iterations must equal the three positive environment stage lengths')
+    if durations[0] != 0 or any(n <= 0 for n in durations[1:]) or sum(durations) != opt.iterations:
+        raise ValueError('AD-GS requires env_scaled_iterations=0 and iterations=env_joint_iterations+env_controller_iterations')
     if not 0 < opt.env_train_iterations <= opt.env_scaled_iterations + opt.env_joint_iterations:
         raise ValueError('env_train_iterations must end before controller-only training')
+    if not 0 < opt.env_prune_iteration <= opt.env_train_iterations:
+        raise ValueError('env_prune_iteration must be within environment training')
     if opt.env_points < 4 or not math.isfinite(opt.env_radius_pixel) or opt.env_radius_pixel <= 0:
         raise ValueError('Require env_points >= 4 and finite env_radius_pixel > 0')
     if not math.isfinite(opt.env_min_gradient) or opt.env_min_gradient < 0 or opt.env_min_gradient_hits < 1:
         raise ValueError('Require nonnegative env_min_gradient and positive env_min_gradient_hits')
-    if opt.disable_gradient_scaling or opt.gradient_scale_anneal_end != opt.env_scaled_iterations:
-        raise ValueError('Enable gradient scaling and match its end to env_scaled_iterations')
 
 
 def phase_at(iteration, opt):

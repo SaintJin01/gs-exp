@@ -15,8 +15,9 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 from utils.hdr_utils import sh_to_radiance
+from utils.adgs_utils import rasterize_z_depth, scene_depth_geometry
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False, training_frame=None):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False, training_frame=None, render_z_depth=False):
     """
     Render the scene. 
     
@@ -114,6 +115,22 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             rotations = rotations,
             cov3D_precomp = cov3D_precomp)
         
+    z_depth = None
+    if render_z_depth:
+        depth_rasterizer = GaussianRasterizer(
+            raster_settings=raster_settings._replace(bg=torch.zeros_like(bg_color)))
+        geometry = dict(means3D=means3D, means2D=means2D, shs=None,
+                        opacities=opacity, scales=scales, rotations=rotations,
+                        cov3D_precomp=cov3D_precomp)
+        if separate_sh:
+            geometry["dc"] = None
+        geometry = scene_depth_geometry(geometry, getattr(pc, "env_count", 0))
+        if geometry["means3D"].shape[0]:
+            z_depth = rasterize_z_depth(depth_rasterizer,
+                                       viewpoint_camera.world_view_transform, geometry)
+        else:
+            z_depth = means3D.sum() * 0 + torch.zeros_like(rendered_image[:1])
+
     # Apply exposure to rendered image (training only)
     if use_trained_exp:
         exposure = pc.get_exposure_from_name(viewpoint_camera.image_name)
@@ -129,7 +146,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         "viewspace_points": screenspace_points,
         "visibility_filter" : (radii > 0).nonzero(),
         "radii": radii,
-        "depth" : depth_image
+        "depth" : depth_image,
+        "z_depth": z_depth
         }
     
     return out

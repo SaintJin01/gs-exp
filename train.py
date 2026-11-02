@@ -18,11 +18,11 @@ import sys
 from scene import Scene, GaussianModel
 from scene.environment_gaussian import (EnvironmentGaussianModel, validate_environment_options,
     phase_at)
-from utils.general_utils import safe_state, get_expon_lr_func
+from utils.general_utils import safe_state
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
-from utils.hdr_utils import dk_gradient_weights, scale_densification_gradient
+from utils.adgs_utils import adgs_phase, edge_aware_depth_loss, opacity_reset_due
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 try:
@@ -48,10 +48,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
 
-    if opt.isp_lr <= 0 or opt.controller_lr <= 0 or opt.gradient_scale_radius <= 0:
-        raise ValueError("isp_lr, controller_lr and gradient_scale_radius must be positive")
-    if not 0 <= opt.gradient_scale_anneal_start < opt.gradient_scale_anneal_end:
-        raise ValueError("Require 0 <= gradient_scale_anneal_start < gradient_scale_anneal_end")
+    if opt.isp_lr <= 0 or opt.controller_lr <= 0:
+        raise ValueError("isp_lr and controller_lr must be positive")
+    if opt.densification_interval != 100 or opt.opacity_reset_interval != 3000:
+        raise ValueError("AD-GS requires densification_interval=100 and opacity_reset_interval=3000")
     first_iter = 0
     environment = getattr(dataset, 'env_background', False)
     if environment:
@@ -79,7 +79,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     iter_end = torch.cuda.Event(enable_timing = True)
 
     use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE 
-    depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
 
     viewpoint_stack = scene.getTrainCameras().copy()
     viewpoint_indices = list(range(len(viewpoint_stack)))
@@ -115,6 +114,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         iter_start.record()
 
         controller_stage = gaussians.set_camera_stage(iteration)
+        _, apply_depth, densify_threshold, prune_threshold = adgs_phase(iteration, controller_stage)
         gaussians.update_learning_rate(iteration)
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if not controller_stage and scene_iteration % 1000 == 0:
@@ -134,7 +134,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE, training_frame=viewpoint_cam.image_name)
+        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE, training_frame=viewpoint_cam.image_name,
+                            render_z_depth=apply_depth and opt.depth_smooth_weight > 0)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
         if viewpoint_cam.alpha_mask is not None:
@@ -153,22 +154,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if gaussians.hdr_camera:
             loss = loss + gaussians.camera_model.regularization_loss()
 
-        # Depth regularization
-        Ll1depth_pure = 0.0
-        if not controller_stage and depth_l1_weight(scene_iteration) > 0 and viewpoint_cam.depth_reliable:
-            invDepth = render_pkg["depth"]
-            mono_invdepth = viewpoint_cam.invdepthmap.cuda()
-            depth_mask = viewpoint_cam.depth_mask.cuda()
-
-            Ll1depth_pure = torch.abs((invDepth  - mono_invdepth) * depth_mask).mean()
-            Ll1depth = depth_l1_weight(scene_iteration) * Ll1depth_pure
-            loss += Ll1depth
-            Ll1depth = Ll1depth.item()
-        else:
-            Ll1depth = 0
+        # AD-GS geometry regularization sees SfM only; RGB still includes env.
+        Ll1depth = 0.0
+        if apply_depth and opt.depth_smooth_weight > 0:
+            depth_loss = edge_aware_depth_loss(render_pkg["z_depth"], gt_image,
+                                               opt.depth_smooth_weight, opt.depth_range_weight)
+            loss = loss + depth_loss
+            Ll1depth = depth_loss.item()
 
         loss.backward()
-        if environment and iteration <= opt.env_train_iterations:
+        if environment and iteration <= opt.env_prune_iteration:
             gaussians.record_environment_gradients()
 
         iter_end.record()
@@ -188,20 +183,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if not controller_stage and scene_iteration < opt.densify_until_iter:
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-                if gaussians.hdr_camera and not opt.disable_gradient_scaling:
-                    weights = dk_gradient_weights(
-                        gaussians.get_xyz, viewpoint_cam.world_view_transform,
-                        opt.gradient_scale_radius * scene.cameras_extent, scene_iteration,
-                        opt.gradient_scale_anneal_start, opt.gradient_scale_anneal_end)
-                    scale_densification_gradient(viewspace_point_tensor, weights)
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
                 if scene_iteration > opt.densify_from_iter and scene_iteration % opt.densification_interval == 0:
-                    size_threshold = 20 if scene_iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
-                
-                if scene_iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and scene_iteration == opt.densify_from_iter):
-                    gaussians.reset_opacity()
+                    gaussians.densify_and_prune(densify_threshold, prune_threshold,
+                                               scene.cameras_extent, None, radii)
 
             # Rotation-only freeze through env_train_iterations, then freeze
             # the whole environment prefix without freezing SfM.
@@ -228,7 +214,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         gaussians.optimizer.step()
                     gaussians.optimizer.zero_grad(set_to_none = True)
 
-            if environment and iteration == opt.env_train_iterations:
+            if opacity_reset_due(iteration, controller_stage, opt.opacity_reset_interval):
+                gaussians.reset_opacity()
+
+            if environment and iteration == opt.env_prune_iteration:
                 gaussians.prune_untrained_environment()
 
             # Log and save
@@ -314,8 +303,8 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 24_000, 30_000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 24_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
