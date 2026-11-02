@@ -42,7 +42,7 @@ def main():
             subprocess.run([sys.executable, *map(str, args)], cwd=ROOT, check=True)
 
         model = tmp / "model"
-        common = ["-s", data, "--eval", "--ppisp", "--iterations", "10", "--disable_viewer",
+        common = ["-s", data, "--eval", "--iterations", "10", "--disable_viewer",
                   "--test_iterations", "5", "10", "--save_iterations", "8", "10",
                   "--checkpoint_iterations", "5", "9", "--densify_until_iter", "7",
                   "--densify_from_iter", "1", "--densification_interval", "2",
@@ -55,10 +55,7 @@ def main():
             resumed = tmp / f"resume_{checkpoint}"
             run("train.py", "-m", resumed, *common, "--start_checkpoint", model / f"chkpnt{checkpoint}.pth")
             run("render.py", "-m", resumed, "--iteration", "10", "--skip_train")
-        baseline = tmp / "baseline"
-        run("train.py", "-s", data, "-m", baseline, "--iterations", "2", "--disable_viewer")
-        run("render.py", "-m", baseline, "--iteration", "2")
-        print("PASS: real 3DGS train/render, early/final ISP snapshots, resume before/after freeze, baseline")
+        print("PASS: real 3DGS train/render, early/final ISP snapshots, resume before/after freeze")
 
 
 if __name__ == "__main__":

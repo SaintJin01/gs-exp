@@ -52,7 +52,7 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
         if dataset.ppisp:
             if dataset.train_test_exp:
-                raise ValueError("--ppisp and --train_test_exp are mutually exclusive.")
+                raise ValueError("--train_test_exp is unavailable because PPISP is always enabled.")
             gaussians.ppisp_adapter = PPISPAdapter.load(
                 dataset.model_path, scene.loaded_iter, scene.getTrainCameras())
 

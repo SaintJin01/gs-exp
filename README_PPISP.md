@@ -32,7 +32,7 @@ synthetic scene containing transforms_train.json and transforms_test.json:
 cd /home/sj/work/PPIPS/gaussian-splatting
 conda activate 3dgs-ppisp
 read -r -p "Dataset absolute path: " DATA
-python train.py -s "$DATA" -m output/ppisp --eval --ppisp \
+python train.py -s "$DATA" -m output/ppisp --eval \
   --iterations 30000 --disable_viewer --checkpoint_iterations 7000 24000 30000
 python render.py -m output/ppisp --iteration 30000
 python metrics.py -m output/ppisp
@@ -49,7 +49,7 @@ views use the camera's controller, as in upstream PPISP.
 Keep the original dataset split, image directory and total iteration count:
 
 ```bash
-python train.py -s "$DATA" -m output/ppisp --eval --ppisp \
+python train.py -s "$DATA" -m output/ppisp --eval \
   --iterations 30000 --disable_viewer \
   --start_checkpoint output/ppisp/chkpnt24000.pth
 ```
@@ -60,10 +60,14 @@ serialized, so a resumed trajectory is not guaranteed bit-for-bit identical.
 
 ## Behavior
 
-- --ppisp is opt-in. Without it the original 3DGS path runs.
-- --train_test_exp and --ppisp cannot be combined.
+- PPISP is always enabled; there is no non-PPISP mode in this branch.
+- --train_test_exp is unavailable because PPISP is always enabled.
 - Raw rasterizer RGB reaches PPISP before any upper clamp; evaluation/output
   clamps to the display range.
+- Gaussian-DK gradient scaling is enabled by default for densification statistics only.
+  It does not alter render forward output or Gaussian/PPISP optimizer gradients. The
+  default radius is one scene extent; scaling is half-annealed at step 4000 and off
+  from step 7000. Use the gradient_scale_* options to tune the schedule.
 - The first 80% of steps jointly train Gaussians and ISP parameters. At scheduler
   step 24000 (for 30000 total), the following training step starts the controller
   phase. Gaussian updates, SH progression, densification, opacity reset and depth

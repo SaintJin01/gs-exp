@@ -54,10 +54,11 @@ class ModelParams(ParamGroup):
         self._resolution = -1
         self._white_background = False
         self.train_test_exp = False
-        self.ppisp = False
         self.data_device = "cuda"
         self.eval = False
         super().__init__(parser, "Loading Parameters", sentinel)
+        self.ppisp = True
+        parser.set_defaults(ppisp=True)
 
     def extract(self, args):
         g = super().extract(args)
@@ -75,6 +76,10 @@ class PipelineParams(ParamGroup):
 class OptimizationParams(ParamGroup):
     def __init__(self, parser):
         self.iterations = 30_000
+        self.disable_gradient_scaling = False
+        self.gradient_scale_radius = 1.0
+        self.gradient_scale_anneal_start = 4000
+        self.gradient_scale_anneal_end = 7000
         self.position_lr_init = 0.00016
         self.position_lr_final = 0.0000016
         self.position_lr_delay_mult = 0.01

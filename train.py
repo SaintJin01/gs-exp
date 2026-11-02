@@ -20,6 +20,7 @@ from utils.general_utils import safe_state, get_expon_lr_func
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
+from utils.gradient_scaling import dk_gradient_weights, scale_densification_gradient
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from utils.ppisp_utils import PPISPAdapter
@@ -46,8 +47,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
 
+    if opt.gradient_scale_radius <= 0:
+        raise ValueError("gradient_scale_radius must be positive")
+    if not 0 <= opt.gradient_scale_anneal_start < opt.gradient_scale_anneal_end:
+        raise ValueError("Require 0 <= gradient_scale_anneal_start < gradient_scale_anneal_end")
+
     if dataset.ppisp and dataset.train_test_exp:
-        raise ValueError("--ppisp and --train_test_exp are mutually exclusive.")
+        raise ValueError("--train_test_exp is unavailable because PPISP is always enabled.")
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
@@ -62,7 +68,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             model_params, first_iter = saved
         if dataset.ppisp != (ppisp_state is not None):
-            raise ValueError("Checkpoint PPISP mode must match --ppisp.")
+            raise ValueError("Checkpoint must contain PPISP state.")
         gaussians.restore(model_params, opt)
     isp = PPISPAdapter(scene.getTrainCameras(), opt.iterations, ppisp_state) if dataset.ppisp else None
     gaussians.ppisp_adapter = isp
@@ -184,6 +190,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if not distilling and iteration < opt.densify_until_iter:
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+                if not opt.disable_gradient_scaling:
+                    weights = dk_gradient_weights(
+                        gaussians.get_xyz, viewpoint_cam.world_view_transform,
+                        opt.gradient_scale_radius * scene.cameras_extent, iteration,
+                        opt.gradient_scale_anneal_start, opt.gradient_scale_anneal_end)
+                    scale_densification_gradient(viewspace_point_tensor, weights)
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
