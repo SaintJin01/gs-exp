@@ -20,6 +20,7 @@ from utils.general_utils import safe_state
 from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams, get_combined_args
 from gaussian_renderer import GaussianModel
+from utils.ppisp_utils import PPISPAdapter
 try:
     from diff_gaussian_rasterization import SparseGaussianAdam
     SPARSE_ADAM_AVAILABLE = True
@@ -49,6 +50,11 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
     with torch.no_grad():
         gaussians = GaussianModel(dataset.sh_degree)
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
+        if dataset.ppisp:
+            if dataset.train_test_exp:
+                raise ValueError("--ppisp and --train_test_exp are mutually exclusive.")
+            gaussians.ppisp_adapter = PPISPAdapter.load(
+                dataset.model_path, scene.loaded_iter, scene.getTrainCameras())
 
         bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")

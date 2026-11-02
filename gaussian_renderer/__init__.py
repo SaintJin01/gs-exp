@@ -14,10 +14,8 @@ import math
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
-from utils.hdr_utils import sh_to_radiance
-from utils.fsgs_depth import rasterize_z_depth
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False, training_frame=None, render_z_depth=False):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False):
     """
     Render the scene. 
     
@@ -72,17 +70,14 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
     # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
     shs = None
-    dc = None
     colors_precomp = None
-    if pc.hdr_camera and use_trained_exp:
-        raise ValueError("The shared HDR camera cannot use per-view exposure matrices")
     if override_color is None:
-        if pc.hdr_camera or pipe.convert_SHs_python:
+        if pipe.convert_SHs_python:
             shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
             dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
             dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
             sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
-            colors_precomp = sh_to_radiance(sh2rgb) if pc.hdr_camera else torch.clamp_min(sh2rgb + 0.5, 0.0)
+            colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
         else:
             if separate_sh:
                 dc, shs = pc.get_features_dc, pc.get_features_rest
@@ -114,37 +109,27 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             rotations = rotations,
             cov3D_precomp = cov3D_precomp)
         
-    z_depth = None
-    if render_z_depth:
-        # Identical culling, sorting, covariance, AA and alpha termination rules.
-        # Only the background and per-Gaussian color payload differ from RGB.
-        depth_rasterizer = GaussianRasterizer(
-            raster_settings=raster_settings._replace(bg=torch.zeros_like(bg_color)))
-        geometry = dict(means3D=means3D, means2D=means2D, shs=None,
-                        opacities=opacity, scales=scales, rotations=rotations,
-                        cov3D_precomp=cov3D_precomp)
-        if separate_sh:
-            geometry["dc"] = None
-        z_depth = rasterize_z_depth(depth_rasterizer,
-                                   viewpoint_camera.world_view_transform, geometry)
-
     # Apply exposure to rendered image (training only)
+    ppisp_adapter = getattr(pc, "ppisp_adapter", None)
+    if use_trained_exp and ppisp_adapter is not None:
+        raise ValueError("PPISP cannot be combined with train_test_exp.")
     if use_trained_exp:
         exposure = pc.get_exposure_from_name(viewpoint_camera.image_name)
         rendered_image = torch.matmul(rendered_image.permute(1, 2, 0), exposure[:3, :3]).permute(2, 0, 1) + exposure[:3, 3,   None, None]
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
-    radiance_image = rendered_image if pc.hdr_camera else None
-    rendered_image = pc.camera_model(radiance_image, camera_id=getattr(viewpoint_camera, "colmap_id", None), frame_name=training_frame) if pc.hdr_camera else rendered_image.clamp(0, 1)
+    # Keep HDR radiance and its gradients until after ISP processing.
+    if ppisp_adapter is not None:
+        rendered_image = ppisp_adapter.apply(rendered_image, viewpoint_camera)
+    else:
+        rendered_image = rendered_image.clamp(0, 1)
     out = {
         "render": rendered_image,
-        "radiance": radiance_image,
         "viewspace_points": screenspace_points,
         "visibility_filter" : (radii > 0).nonzero(),
         "radii": radii,
-        "depth" : depth_image,
-        "z_depth": z_depth
+        "depth" : depth_image
         }
     
     return out

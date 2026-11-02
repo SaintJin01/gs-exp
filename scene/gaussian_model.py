@@ -18,7 +18,6 @@ import json
 from utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import RGB2SH
-from scene.camera_gcisp import GCISP
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
@@ -65,48 +64,9 @@ class GaussianModel:
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self.setup_functions()
-        self.hdr_camera = False
-        self.camera_model = None
-        self.camera_optimizer = None
-        self.camera_config = None
-
-    def configure_camera(self, enabled=False, frame_names=None, camera_ids=None, controller_activation_ratio=6.0 / 7.0):
-        self.hdr_camera = enabled
-        self.camera_config = dict(frame_names=frame_names, camera_ids=camera_ids,
-            controller_activation_ratio=controller_activation_ratio) if enabled else None
-        self.camera_model = GCISP(**self.camera_config).cuda() if enabled else None
-        self.controller_stage = False
-
-    def set_camera_stage(self, iteration):
-        if not self.hdr_camera:
-            return False
-        self.controller_stage = self.camera_model.set_stage(iteration, self.camera_training_iterations)
-        for tensor in (self._xyz, self._features_dc, self._features_rest, self._scaling, self._rotation, self._opacity):
-            tensor.requires_grad_(not self.controller_stage)
-        return self.controller_stage
-
-    def save_camera(self, ply_path):
-        if self.hdr_camera:
-            torch.save(dict(version=4, camera_type="gcisp", radiance_activation="clamp_sh_plus_half",
-                            config=self.camera_config, state_dict=self.camera_model.state_dict()),
-                       os.path.join(os.path.dirname(ply_path), "camera_gcisp.pth"))
-
-    def load_camera(self, ply_path):
-        path = os.path.join(os.path.dirname(ply_path), "camera_gcisp.pth")
-        if os.path.exists(path):
-            payload = torch.load(path, map_location="cuda")
-            if payload.get("version") != 4 or payload.get("camera_type") != "gcisp" or payload.get("radiance_activation") != "clamp_sh_plus_half":
-                raise ValueError("Expected GCISP v4 with clamp(SH + 0.5, min=0); old softplus models require retraining")
-            self.configure_camera(True, **payload["config"])
-            self.camera_model.load_state_dict(payload["state_dict"])
-            self.camera_model.eval()
-        elif any(os.path.exists(os.path.join(os.path.dirname(ply_path), name)) for name in ("camera_transformer.pth", "camera_cnn.pth")):
-            raise ValueError("Legacy ViT/CNN camera files cannot be used by GCISP")
-        elif self.hdr_camera:
-            raise FileNotFoundError("HDR rendering requires " + path)
 
     def capture(self):
-        state = (
+        return (
             self.active_sh_degree,
             self._xyz,
             self._features_dc,
@@ -120,24 +80,8 @@ class GaussianModel:
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
         )
-        if not self.hdr_camera:
-            return state
-        return dict(version=4, camera_type="gcisp", radiance_activation="clamp_sh_plus_half", camera_training_iterations=self.camera_training_iterations, gaussians=state, camera_config=self.camera_config,
-                    camera=self.camera_model.state_dict(),
-                    camera_optimizer=self.camera_optimizer.state_dict())
-
+    
     def restore(self, model_args, training_args):
-        camera_state = model_args if isinstance(model_args, dict) else None
-        if camera_state is not None:
-            if camera_state.get("version") != 4 or camera_state.get("camera_type") != "gcisp" or camera_state.get("radiance_activation") != "clamp_sh_plus_half" or not self.hdr_camera:
-                raise ValueError("Resume a GCISP v4 checkpoint with --hdr_camera; old softplus and ViT/CNN checkpoints require retraining")
-            if camera_state["camera_config"] != self.camera_config:
-                raise ValueError("Checkpoint camera architecture does not match CLI options")
-            if camera_state["camera_training_iterations"] != training_args.iterations:
-                raise ValueError("Keep --iterations unchanged when resuming the two-stage GCISP schedule")
-            model_args = camera_state["gaussians"]
-        elif self.hdr_camera:
-            raise ValueError("An LDR checkpoint cannot be resumed as HDR; start a fresh HDR run")
         (self.active_sh_degree, 
         self._xyz, 
         self._features_dc, 
@@ -154,9 +98,6 @@ class GaussianModel:
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
         self.optimizer.load_state_dict(opt_dict)
-        if camera_state is not None:
-            self.camera_model.load_state_dict(camera_state["camera"])
-            self.camera_optimizer.load_state_dict(camera_state["camera_optimizer"])
 
     @property
     def get_scaling(self):
@@ -208,8 +149,7 @@ class GaussianModel:
     def create_from_pcd(self, pcd : BasicPointCloud, cam_infos : int, spatial_lr_scale : float):
         self.spatial_lr_scale = spatial_lr_scale
         fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
-        rgb = torch.tensor(np.asarray(pcd.colors)).float().cuda()
-        fused_color = RGB2SH(rgb)
+        fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
         features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
         features[:, :3, 0 ] = fused_color
         features[:, 3:, 1:] = 0.0
@@ -258,15 +198,7 @@ class GaussianModel:
                 # A special version of the rasterizer is required to enable sparse adam
                 self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
 
-        self.exposure_optimizer = None if self.hdr_camera else torch.optim.Adam([self._exposure])
-        if self.hdr_camera:
-            self._exposure.requires_grad_(False)
-            self.camera_model.train()
-            self.camera_training_iterations = training_args.iterations
-            self.isp_lr = training_args.isp_lr
-            self.camera_optimizer = torch.optim.Adam([
-                {'params': [self.camera_model.exposure_params, self.camera_model.crf_params], 'lr': training_args.isp_lr},
-                {'params': self.camera_model.controllers.parameters(), 'lr': training_args.controller_lr}], eps=1e-15)
+        self.exposure_optimizer = torch.optim.Adam([self._exposure])
 
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale,
@@ -280,11 +212,7 @@ class GaussianModel:
 
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
-        if self.camera_optimizer is not None:
-            step = max(0, iteration-1)
-            factor = (0.01 + 0.99*step/500) if step < 500 else 0.01**((step-500)/30000.)
-            self.camera_optimizer.param_groups[0]['lr'] = self.isp_lr * factor
-        if self.exposure_optimizer is not None and self.pretrained_exposures is None:
+        if self.pretrained_exposures is None:
             for param_group in self.exposure_optimizer.param_groups:
                 param_group['lr'] = self.exposure_scheduler_args(iteration)
 
@@ -326,7 +254,6 @@ class GaussianModel:
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
-        self.save_camera(path)
 
     def reset_opacity(self):
         opacities_new = self.inverse_opacity_activation(torch.min(self.get_opacity, torch.ones_like(self.get_opacity)*0.01))
@@ -334,9 +261,6 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
 
     def load_ply(self, path, use_train_test_exp = False):
-        self.load_camera(path)
-        if self.hdr_camera and use_train_test_exp:
-            raise ValueError("HDR camera does not use per-view trained exposure")
         plydata = PlyData.read(path)
         if use_train_test_exp:
             exposure_file = os.path.join(os.path.dirname(path), os.pardir, os.pardir, "exposure.json")

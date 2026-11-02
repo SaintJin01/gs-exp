@@ -16,13 +16,13 @@ from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
-from utils.general_utils import safe_state
+from utils.general_utils import safe_state, get_expon_lr_func
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
-from utils.fsgs_depth import prepare_depth_priors, load_prior, fsgs_depth_loss
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+from utils.ppisp_utils import PPISPAdapter
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -46,25 +46,26 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
 
-    if opt.isp_lr <= 0 or opt.controller_lr <= 0:
-        raise ValueError("isp_lr and controller_lr must be positive")
-    if opt.depth_weight < 0:
-        raise ValueError("depth_weight must be nonnegative")
+    if dataset.ppisp and dataset.train_test_exp:
+        raise ValueError("--ppisp and --train_test_exp are mutually exclusive.")
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
+    ppisp_state = None
     if checkpoint:
-        (model_params, first_iter) = torch.load(checkpoint)
+        saved = torch.load(checkpoint, weights_only=False)
+        if isinstance(saved, dict):
+            model_params, first_iter = saved["gaussians"], saved["iteration"]
+            ppisp_state = saved.get("ppisp")
+        else:
+            model_params, first_iter = saved
+        if dataset.ppisp != (ppisp_state is not None):
+            raise ValueError("Checkpoint PPISP mode must match --ppisp.")
         gaussians.restore(model_params, opt)
-
-    # Only training cameras contribute priors. Skip model loading for controller resume.
-    joint_end = (int(opt.iterations * gaussians.camera_model.config["controller_activation_ratio"])
-                 if gaussians.hdr_camera else opt.iterations)
-    if opt.depth_weight > 0 and first_iter < joint_end:
-        prepare_depth_priors(scene.getTrainCameras(),
-                             os.path.join(dataset.model_path, "fsgs_depth_cache"))
+    isp = PPISPAdapter(scene.getTrainCameras(), opt.iterations, ppisp_state) if dataset.ppisp else None
+    gaussians.ppisp_adapter = isp
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -73,6 +74,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     iter_end = torch.cuda.Event(enable_timing = True)
 
     use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE 
+    depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
 
     viewpoint_stack = scene.getTrainCameras().copy()
     viewpoint_indices = list(range(len(viewpoint_stack)))
@@ -99,13 +101,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         iter_start.record()
 
-        controller_stage = gaussians.set_camera_stage(iteration)
-        apply_depth = not controller_stage and opt.depth_weight > 0
-        phase = "controller" if controller_stage else "joint"
-        gaussians.update_learning_rate(iteration)
+        distilling = isp is not None and isp.distilling
+        if distilling:
+            for group in gaussians.optimizer.param_groups:
+                for parameter in group["params"]:
+                    parameter.requires_grad_(False)
+            gaussians.optimizer.zero_grad(set_to_none=True)
+        else:
+            gaussians.update_learning_rate(iteration)
 
-        # Original 3DGS SH schedule (maximum degree is unchanged).
-        if not controller_stage and iteration % 1000 == 0:
+        # Every 1000 its we increase the levels of SH up to a maximum degree
+        if not distilling and iteration % 1000 == 0:
             gaussians.oneupSHdegree()
 
         # Pick a random Camera
@@ -122,12 +128,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE, training_frame=viewpoint_cam.image_name, render_z_depth=apply_depth)
+        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
         if viewpoint_cam.alpha_mask is not None:
             alpha_mask = viewpoint_cam.alpha_mask.cuda()
-            image = image * alpha_mask
+            image *= alpha_mask
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
@@ -139,15 +145,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
-        if gaussians.hdr_camera:
-            loss = loss + gaussians.camera_model.regularization_loss()
+        if isp is not None and not distilling:
+            loss = loss + isp.module.get_regularization_loss()
 
-        Ll1depth = 0.0
-        if apply_depth:
-            prior = load_prior(viewpoint_cam, render_pkg["z_depth"].device)
-            depth_loss = opt.depth_weight * fsgs_depth_loss(render_pkg["z_depth"], prior)
-            loss = loss + depth_loss
-            Ll1depth = depth_loss.detach().item()
+        # Depth regularization
+        Ll1depth_pure = 0.0
+        if not distilling and depth_l1_weight(iteration) > 0 and viewpoint_cam.depth_reliable:
+            invDepth = render_pkg["depth"]
+            mono_invdepth = viewpoint_cam.invdepthmap.cuda()
+            depth_mask = viewpoint_cam.depth_mask.cuda()
+
+            Ll1depth_pure = torch.abs((invDepth  - mono_invdepth) * depth_mask).mean()
+            Ll1depth = depth_l1_weight(iteration) * Ll1depth_pure 
+            loss += Ll1depth
+            Ll1depth = Ll1depth.item()
+        else:
+            Ll1depth = 0
 
         loss.backward()
 
@@ -159,53 +172,53 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
 
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"Phase": phase, "Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"})
+                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"})
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
 
+            # Log and save
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
+
             # Densification
-            if not controller_stage and iteration < opt.densify_until_iter:
+            if not distilling and iteration < opt.densify_until_iter:
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005,
-                                               scene.cameras_extent, size_threshold, radii)
-
-                if iteration % opt.opacity_reset_interval == 0 or (
-                        dataset.white_background and iteration == opt.densify_from_iter):
+                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
+                
+                if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
 
             # Optimizer step
-            if iteration < opt.iterations or gaussians.hdr_camera:
-                if gaussians.camera_optimizer is not None:
-                    gaussians.camera_optimizer.step()
-                    gaussians.camera_model.mark_controller_update()
-                    gaussians.camera_optimizer.zero_grad(set_to_none=True)
-                if gaussians.exposure_optimizer is not None:
-                    gaussians.exposure_optimizer.step()
-                    gaussians.exposure_optimizer.zero_grad(set_to_none=True)
-                if not controller_stage and use_sparse_adam:
+            if not distilling and (iteration < opt.iterations or isp is not None):
+                gaussians.exposure_optimizer.step()
+                gaussians.exposure_optimizer.zero_grad(set_to_none = True)
+                if use_sparse_adam:
                     visible = radii > 0
                     gaussians.optimizer.step(visible, radii.shape[0])
                     gaussians.optimizer.zero_grad(set_to_none = True)
-                elif not controller_stage:
+                else:
                     gaussians.optimizer.step()
                     gaussians.optimizer.zero_grad(set_to_none = True)
 
-            # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
-            if (iteration in saving_iterations):
+            if isp is not None:
+                isp.step()
+
+            if iteration in saving_iterations:
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
-
+                if isp is not None:
+                    isp.save(scene.model_path, iteration)
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
-                torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+                state = (gaussians.capture(), iteration) if isp is None else {
+                    "gaussians": gaussians.capture(), "iteration": iteration, "ppisp": isp.capture()}
+                torch.save(state, scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -279,8 +292,8 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000, 35_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000, 35_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
