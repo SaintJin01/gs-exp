@@ -33,8 +33,8 @@ cd /home/sj/work/gs-exp
 conda activate 3dgs-ppisp
 read -r -p "Dataset absolute path: " DATA
 python train.py -s "$DATA" -m output/ppisp --eval \
-  --iterations 16000 --disable_viewer --checkpoint_iterations 7000 10000 16000
-python render.py -m output/ppisp --iteration 16000
+  --iterations 30000 --disable_viewer --checkpoint_iterations 7000 24000 30000
+python render.py -m output/ppisp --iteration 30000
 python metrics.py -m output/ppisp
 ```
 
@@ -50,8 +50,8 @@ Keep the original dataset split, image directory and total iteration count:
 
 ```bash
 python train.py -s "$DATA" -m output/ppisp --eval \
-  --iterations 16000 --disable_viewer \
-  --start_checkpoint output/ppisp/chkpnt10000.pth
+  --iterations 30000 --disable_viewer \
+  --start_checkpoint output/ppisp/chkpnt24000.pth
 ```
 
 Gaussian parameters, PPISP parameters, PPISP optimizers/schedulers, configuration,
@@ -69,19 +69,19 @@ serialized, so a resumed trajectory is not guaranteed bit-for-bit identical.
   Warm-up: iterations 1..1500. Afterwards, `iteration % 200 >= 100` selects Low;
   the other 100 iterations select High. Thresholds (gradient, opacity) are
   warm-up=(0.0005,0.005), High=(0.0002,0.005), Low=(0.0005,0.1).
-  Densification/pruning runs every 100 steps after 500 and before 10000 (last 9900).
+  Densification/pruning runs every 100 steps after 500 and before 24000 (last 23900).
   Size-based pruning is disabled. Low-phase depth regularization runs only during
-  the initial 10000-step joint-training stage: smooth_weight=0.01, range_weight=0.001.
+  the initial 24000-step joint-training stage: smooth_weight=0.01, range_weight=0.001.
   It uses GT RGB edges and alpha-composited z-depth from a second rasterizer pass;
   the rasterizer submodule is unchanged. Both passes share screen-space gradients.
   Opacity resets to at most 0.05 after the optimizer at 501+3000*k until distillation.
   SH still increments every 1000 steps; the older 5000-step SH experiment is not used.
   This is the earlier single-model AD-GS adaptation, without two-model pseudo-view
   consistency. Full official PPISP (including vignetting/color correction) remains.
-- By default, steps 1..10000 jointly train Gaussians and ISP parameters, followed
-  by controller-only training at steps 10001..16000 (6000 steps). The activation
-  ratio is 0.625; overriding total iterations scales this split proportionally.
-  Gaussian position learning-rate decay ends at step 10000. In the controller
+- By default, steps 1..24000 jointly train Gaussians and ISP parameters, followed
+  by controller-only training at steps 24001..30000 (6000 steps). The activation
+  ratio is 0.8; overriding total iterations scales this split proportionally.
+  Gaussian position learning-rate decay ends at step 24000. In the controller
   phase, Gaussian updates, SH progression, densification, opacity reset and depth
   loss stop; upstream freezes ISP parameters and detaches radiance input.
 - COLMAP intrinsic camera IDs identify physical cameras; IDs are compacted.
