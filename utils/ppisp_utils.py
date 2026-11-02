@@ -22,7 +22,7 @@ class PPISPAdapter:
         self.frames = {name: i for i, name in enumerate(names)}
         if not names:
             raise ValueError("PPISP requires training cameras.")
-        config = PPISPConfig()
+        config = PPISPConfig(controller_activation_ratio=10_000 / 16_000)
         if payload is not None:
             if payload["camera_ids"] != self.camera_ids or payload["frames"] != self.frames:
                 raise ValueError("PPISP checkpoint camera/frame mapping differs from dataset.")
